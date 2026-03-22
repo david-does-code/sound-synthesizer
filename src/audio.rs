@@ -4,24 +4,9 @@ use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-/// The available waveform types.
-///
-/// Each waveform has a different set of harmonics, which is what gives it
-/// a distinct timbre (tonal character):
-///
-/// - **Sine**: No harmonics at all — just the fundamental frequency. Sounds
-///   pure and empty, like a tuning fork.
-///
-/// - **Square**: Contains only odd harmonics (3rd, 5th, 7th...) at amplitudes
-///   of 1/n. The missing even harmonics give it a hollow, woody quality.
-///   This is the classic chiptune/NES sound.
-///
-/// - **Sawtooth**: Contains ALL harmonics (2nd, 3rd, 4th...) at 1/n amplitude.
-///   The richest waveform — bright and buzzy. Most analog synths use this
-///   as a starting point for subtractive synthesis.
-///
-/// - **Triangle**: Like square, only odd harmonics, but they fall off as 1/n²
-///   (much faster). Sounds softer and warmer — partway between sine and square.
+/// Maximum number of simultaneous voices (notes).
+pub const MAX_VOICES: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Waveform {
@@ -51,31 +36,22 @@ impl Waveform {
         }
     }
 
-    /// Generate a sample for this waveform at the given phase (0.0 to 1.0).
     pub fn sample(self, phase: f32) -> f32 {
         match self {
             Waveform::Sine => (phase * TAU).sin(),
-            Waveform::Square => {
-                if phase < 0.5 { 1.0 } else { -1.0 }
-            }
+            Waveform::Square => if phase < 0.5 { 1.0 } else { -1.0 },
             Waveform::Sawtooth => 2.0 * phase - 1.0,
             Waveform::Triangle => {
-                if phase < 0.5 {
-                    4.0 * phase - 1.0
-                } else {
-                    3.0 - 4.0 * phase
-                }
+                if phase < 0.5 { 4.0 * phase - 1.0 } else { 3.0 - 4.0 * phase }
             }
         }
     }
 }
 
-/// Converts a MIDI note number to a frequency in Hz.
 pub fn midi_to_freq(note: u8) -> f32 {
     440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0)
 }
 
-/// Convert a MIDI note number to a human-readable name like "C4" or "F#5".
 const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 pub fn midi_to_name(note: u8) -> String {
@@ -84,13 +60,10 @@ pub fn midi_to_name(note: u8) -> String {
     format!("{name}{octave}")
 }
 
-/// Pack four f32 ADSR params into a single u64 for atomic transfer.
-/// Each param is quantized to a u16 (0–65535) which gives us more than
-/// enough precision for audio parameters.
 fn pack_adsr(params: &AdsrParams) -> u64 {
-    let a = (params.attack * 10000.0) as u16;  // 0–6.5535s range, 0.1ms precision
+    let a = (params.attack * 10000.0) as u16;
     let d = (params.decay * 10000.0) as u16;
-    let s = (params.sustain * 65535.0) as u16;  // 0.0–1.0 range, full u16 precision
+    let s = (params.sustain * 65535.0) as u16;
     let r = (params.release * 10000.0) as u16;
     ((a as u64) << 48) | ((d as u64) << 32) | ((s as u64) << 16) | (r as u64)
 }
@@ -108,19 +81,79 @@ fn unpack_adsr(packed: u64) -> AdsrParams {
     }
 }
 
-/// A real-time audio engine that plays a single note at a time with ADSR envelope.
+/// Voice commands sent from main thread → audio callback.
+const CMD_IDLE: u32 = 0;
+const CMD_PLAY: u32 = 1;
+const CMD_RELEASE: u32 = 2;
+
+fn pack_cmd(cmd: u32, midi: u8) -> u32 {
+    (cmd << 16) | (midi as u32)
+}
+
+fn unpack_cmd(packed: u32) -> (u32, u8) {
+    (packed >> 16, (packed & 0xFF) as u8)
+}
+
+/// State for a single voice inside the audio callback.
+struct Voice {
+    frequency: f32,
+    phase: f32,
+    envelope: Envelope,
+    active: bool,
+}
+
+impl Voice {
+    fn new(sample_rate: f32) -> Self {
+        Voice {
+            frequency: 0.0,
+            phase: 0.0,
+            envelope: Envelope::new(sample_rate),
+            active: false,
+        }
+    }
+
+    fn next_sample(&mut self, waveform: Waveform) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+
+        let env_amp = self.envelope.next_sample();
+
+        if env_amp <= 0.0 {
+            self.active = false;
+            return 0.0;
+        }
+
+        let value = waveform.sample(self.phase) * env_amp;
+
+        self.phase += self.frequency / self.envelope.sample_rate();
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+
+        value
+    }
+}
+
+/// A polyphonic real-time audio engine.
 ///
-/// Communication between the main thread and the audio callback is entirely
-/// lock-free using atomics:
-/// - `frequency`: AtomicU32 (f32 bit pattern) for the note pitch
-/// - `waveform`: AtomicU8 for the waveform type
-/// - `gate`: AtomicBool for note on/off (triggers envelope)
-/// - `adsr_packed`: AtomicU64 for ADSR parameters
+/// Supports up to MAX_VOICES simultaneous notes. The main thread
+/// allocates voices and the audio callback generates samples.
+///
+/// Communication is lock-free:
+/// - `voice_commands`: AtomicU32 array — main thread writes play/release commands
+/// - `voice_active`: AtomicBool array — callback reports which voices are sounding
+///   (the main thread reads this to find free voices)
+/// - `waveform`: AtomicU8
+/// - `adsr_packed`: AtomicU64
 pub struct AudioEngine {
     _stream: cpal::Stream,
-    frequency: Arc<AtomicU32>,
+    voice_commands: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Set to true by the callback when a voice starts playing,
+    /// set to false when its envelope finishes. The main thread reads
+    /// this to find free voices for allocation.
+    voice_active: Arc<[AtomicBool; MAX_VOICES]>,
     waveform: Arc<AtomicU8>,
-    gate: Arc<AtomicBool>,
     adsr_packed: Arc<AtomicU64>,
 }
 
@@ -137,70 +170,84 @@ impl AudioEngine {
         let sample_rate = config.sample_rate().0 as f32;
         let channels = config.channels() as usize;
 
-        let frequency = Arc::new(AtomicU32::new(0u32));
-        let freq_clone = frequency.clone();
+        let voice_commands: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(CMD_IDLE)),
+        );
+        let cmds_clone = voice_commands.clone();
+
+        let voice_active: Arc<[AtomicBool; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicBool::new(false)),
+        );
+        let active_clone = voice_active.clone();
 
         let waveform = Arc::new(AtomicU8::new(Waveform::Sine as u8));
         let wave_clone = waveform.clone();
-
-        let gate = Arc::new(AtomicBool::new(false));
-        let gate_clone = gate.clone();
 
         let default_params = AdsrParams::default();
         let adsr_packed = Arc::new(AtomicU64::new(pack_adsr(&default_params)));
         let adsr_clone = adsr_packed.clone();
 
-        let mut phase: f32 = 0.0;
-        let mut envelope = Envelope::new(sample_rate);
-        let mut prev_gate = false;
+        let mut voices: Vec<Voice> = (0..MAX_VOICES)
+            .map(|_| Voice::new(sample_rate))
+            .collect();
         let mut prev_adsr_packed = pack_adsr(&default_params);
 
         let stream = device
             .build_output_stream(
                 &config.into(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let freq_bits = freq_clone.load(Ordering::Relaxed);
-                    let freq = f32::from_bits(freq_bits);
                     let wave = Waveform::from_u8(wave_clone.load(Ordering::Relaxed));
-                    let gate_on = gate_clone.load(Ordering::Relaxed);
 
-                    // Check if ADSR params changed
+                    // Update ADSR params if changed
                     let current_adsr = adsr_clone.load(Ordering::Relaxed);
                     if current_adsr != prev_adsr_packed {
-                        envelope.set_params(unpack_adsr(current_adsr));
+                        let params = unpack_adsr(current_adsr);
+                        for voice in voices.iter_mut() {
+                            voice.envelope.set_params(params);
+                        }
                         prev_adsr_packed = current_adsr;
                     }
 
-                    // Detect gate transitions
-                    if gate_on && !prev_gate {
-                        envelope.gate_on();
-                    } else if !gate_on && prev_gate {
-                        envelope.gate_off();
+                    // Process commands from the main thread
+                    for (i, cmd_slot) in cmds_clone.iter().enumerate() {
+                        let packed = cmd_slot.load(Ordering::Relaxed);
+                        let (cmd, midi) = unpack_cmd(packed);
+
+                        match cmd {
+                            CMD_PLAY => {
+                                voices[i].frequency = midi_to_freq(midi);
+                                voices[i].phase = 0.0;
+                                voices[i].active = true;
+                                voices[i].envelope.gate_on();
+                                active_clone[i].store(true, Ordering::Relaxed);
+                                cmd_slot.store(CMD_IDLE, Ordering::Relaxed);
+                            }
+                            CMD_RELEASE => {
+                                voices[i].envelope.gate_off();
+                                cmd_slot.store(CMD_IDLE, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
                     }
-                    prev_gate = gate_on;
 
+                    // Generate audio: mix all active voices
                     for frame in data.chunks_mut(channels) {
-                        let env_amp = envelope.next_sample();
+                        let mut mix = 0.0_f32;
 
-                        if env_amp <= 0.0 || freq <= 0.0 {
-                            if freq <= 0.0 {
-                                phase = 0.0;
+                        for (i, voice) in voices.iter_mut().enumerate() {
+                            let was_active = voice.active;
+                            mix += voice.next_sample(wave);
+                            // If voice just became inactive, update the shared flag
+                            if was_active && !voice.active {
+                                active_clone[i].store(false, Ordering::Relaxed);
                             }
-                            for sample in frame.iter_mut() {
-                                *sample = 0.0;
-                            }
-                            continue;
                         }
 
-                        let value = wave.sample(phase) * env_amp * 0.4;
+                        // Scale to prevent clipping: 0.4 base volume, divided by sqrt(max voices)
+                        let value = mix * 0.4 / (MAX_VOICES as f32).sqrt();
 
                         for sample in frame.iter_mut() {
                             *sample = value;
-                        }
-
-                        phase += freq / sample_rate;
-                        if phase >= 1.0 {
-                            phase -= 1.0;
                         }
                     }
                 },
@@ -213,24 +260,40 @@ impl AudioEngine {
 
         AudioEngine {
             _stream: stream,
-            frequency,
+            voice_commands,
+            voice_active,
             waveform,
-            gate,
             adsr_packed,
         }
     }
 
-    /// Start playing a note — sets frequency and opens the gate (triggers attack).
-    pub fn play_note(&self, midi_note: u8) {
-        let freq = midi_to_freq(midi_note);
-        self.frequency.store(freq.to_bits(), Ordering::Relaxed);
-        self.gate.store(true, Ordering::Relaxed);
+    /// Play a note — finds a free voice and assigns it.
+    /// Returns the voice index that was assigned.
+    pub fn play_note(&self, midi_note: u8) -> usize {
+        let idx = self.find_free_voice();
+        self.voice_commands[idx]
+            .store(pack_cmd(CMD_PLAY, midi_note), Ordering::Relaxed);
+        idx
     }
 
-    /// Release the note — closes the gate (triggers release phase).
-    /// The sound will fade out according to the release time, not stop instantly.
-    pub fn stop(&self) {
-        self.gate.store(false, Ordering::Relaxed);
+    /// Release a specific voice by index (triggers ADSR release phase).
+    pub fn release_voice(&self, voice_idx: usize) {
+        if voice_idx < MAX_VOICES {
+            self.voice_commands[voice_idx]
+                .store(pack_cmd(CMD_RELEASE, 0), Ordering::Relaxed);
+        }
+    }
+
+    /// Find a free voice. Prefers voices whose envelope has finished (inactive).
+    /// If all are active, steals voice 0.
+    fn find_free_voice(&self) -> usize {
+        for i in 0..MAX_VOICES {
+            if !self.voice_active[i].load(Ordering::Relaxed) {
+                return i;
+            }
+        }
+        // All voices active — steal voice 0
+        0
     }
 
     pub fn set_waveform(&self, waveform: Waveform) {
@@ -241,12 +304,10 @@ impl AudioEngine {
         Waveform::from_u8(self.waveform.load(Ordering::Relaxed))
     }
 
-    /// Update ADSR envelope parameters (takes effect on next note).
     pub fn set_adsr(&self, params: AdsrParams) {
         self.adsr_packed.store(pack_adsr(&params), Ordering::Relaxed);
     }
 
-    /// Get current ADSR parameters.
     #[allow(dead_code)]
     pub fn adsr(&self) -> AdsrParams {
         unpack_adsr(self.adsr_packed.load(Ordering::Relaxed))

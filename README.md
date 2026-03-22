@@ -1,6 +1,6 @@
 # Sound Synthesizer
 
-A terminal-based sound synthesizer written in Rust. Uses your keyboard as a piano — hold keys to play notes, release to stop.
+A polyphonic terminal-based sound synthesizer written in Rust. Uses your keyboard as a piano — hold multiple keys to play chords, release to stop.
 
 Inspired by [Sebastian Lague's video on synthesizing musical instruments in code](https://www.youtube.com/watch?v=rRnOtKlg4jA).
 
@@ -72,7 +72,7 @@ cargo run
 ```
 src/
 ├── main.rs        — Terminal UI, event loop, two-mode interface (piano + ADSR editor)
-├── audio.rs       — Real-time audio engine (oscillator, waveforms, MIDI-to-frequency)
+├── audio.rs       — Polyphonic audio engine (8 voices, waveforms, MIDI-to-frequency)
 ├── envelope.rs    — ADSR envelope generator (per-sample state machine)
 ├── keyboard.rs    — Evdev keyboard listener (press/release detection)
 ├── notes.rs       — Keyboard layout diagram
@@ -81,9 +81,9 @@ src/
 
 ## Architecture
 
-- **Audio thread** (cpal callback): Generates samples at 44.1kHz. Reads frequency, waveform, gate signal, and ADSR parameters from atomic variables — all lock-free. The ADSR envelope state machine runs per-sample inside the callback.
+- **Audio thread** (cpal callback): Generates samples at 44.1kHz. Runs 8 independent voices, each with its own oscillator and ADSR envelope. Voice commands and active state are communicated via atomic arrays — fully lock-free. Voices are mixed and scaled by √8 to prevent clipping.
 - **Keyboard thread** (evdev): Reads raw input events from `/dev/input/` and sends note, waveform, octave, mode, and arrow key events over an MPSC channel.
-- **Main thread**: Two-mode UI (piano + ADSR editor). Tracks held keys for smooth transitions, manages octave offset, and redraws visualizations using ANSI cursor control.
+- **Main thread**: Two-mode UI (piano + ADSR editor). Maps held MIDI notes to voice indices for correct polyphonic release. Manages octave offset and redraws visualizations using ANSI cursor control.
 
 ## Roadmap
 

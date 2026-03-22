@@ -9,7 +9,7 @@ use crossterm::terminal;
 use envelope::AdsrParams;
 use keyboard::{spawn_keyboard_listener, KeyboardEvent};
 use notes::keyboard_help;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{self, Write};
 
 /// Number of braille rows in the visualizer display.
@@ -74,7 +74,9 @@ fn main() {
 
     let mut mode = Mode::Piano;
     let mut octave_offset: i8 = 0;
-    let mut held_bases: HashSet<u8> = HashSet::new();
+    // Maps MIDI note (after offset) → voice index in the audio engine.
+    // This lets us release the correct voice when a key is released.
+    let mut note_to_voice: HashMap<u8, usize> = HashMap::new();
     let mut adsr = AdsrParams::default();
     let mut selected_param = AdsrParam::Attack;
 
@@ -85,9 +87,9 @@ fn main() {
         match event {
             // === Notes work in both modes ===
             KeyboardEvent::NoteOn { base_midi } => {
-                held_bases.insert(base_midi);
                 let midi = apply_offset(base_midi, octave_offset);
-                engine.play_note(midi);
+                let voice_idx = engine.play_note(midi);
+                note_to_voice.insert(midi, voice_idx);
                 if mode == Mode::Piano {
                     let freq = audio::midi_to_freq(midi);
                     let name = audio::midi_to_name(midi);
@@ -99,16 +101,12 @@ fn main() {
                 }
             }
             KeyboardEvent::NoteOff { base_midi } => {
-                held_bases.remove(&base_midi);
-                if held_bases.is_empty() {
-                    engine.stop();
-                    if mode == Mode::Piano {
-                        redraw_piano_live_area(engine.waveform(), octave_offset, None);
-                    }
-                } else {
-                    let &remaining_base = held_bases.iter().next().unwrap();
-                    let midi = apply_offset(remaining_base, octave_offset);
-                    engine.play_note(midi);
+                let midi = apply_offset(base_midi, octave_offset);
+                if let Some(voice_idx) = note_to_voice.remove(&midi) {
+                    engine.release_voice(voice_idx);
+                }
+                if mode == Mode::Piano && note_to_voice.is_empty() {
+                    redraw_piano_live_area(engine.waveform(), octave_offset, None);
                 }
             }
 

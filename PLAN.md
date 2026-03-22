@@ -49,14 +49,16 @@ how real instruments have characteristic amplitude shapes, gate signal for trigg
 envelope stages, per-sample state machine in the audio callback, lock-free parameter
 transfer via packed AtomicU64.
 
-### Phase 4: Polyphony
+### Phase 4: Polyphony ✅
 
-- [ ] Play multiple notes simultaneously (chords)
-- [ ] Mix multiple oscillators without clipping
-- [ ] Implement voice allocation and stealing
+- [x] Play multiple notes simultaneously (chords) — 8 voices
+- [x] Mix multiple oscillators without clipping (gain scaling by √MAX_VOICES)
+- [x] Implement voice allocation and stealing (oldest voice stolen when all busy)
 
-**Concepts to learn**: additive mixing, gain staging, voice management, basic chord theory
-(major, minor, seventh chords).
+**Concepts learned**: additive mixing (summing voice samples), gain staging (scaling to
+prevent clipping), voice allocation (finding free slots via shared AtomicBool flags),
+voice stealing (reusing the oldest voice when all are busy), the distinction between
+"no pending command" and "voice is free" in lock-free designs.
 
 ### Phase 5: Filters & Subtractive Synthesis
 

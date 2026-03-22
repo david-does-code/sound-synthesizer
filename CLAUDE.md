@@ -7,9 +7,11 @@ See PLAN.md for the roadmap and current progress.
 
 ## Architecture
 
-- `src/audio.rs` — Audio engine. Runs a cpal output stream with a callback that generates
-  samples. Frequency (`AtomicU32`), waveform (`AtomicU8`), gate (`AtomicBool`), and ADSR
-  params (`AtomicU64`, packed) are all communicated lock-free. Contains the `Waveform` enum.
+- `src/audio.rs` — Polyphonic audio engine with 8 voices. Each voice has its own oscillator
+  and ADSR envelope inside the callback closure. Communication is lock-free via:
+  `voice_commands` (`[AtomicU32; 8]` for play/release), `voice_active` (`[AtomicBool; 8]`
+  for the callback to report which voices are sounding), waveform (`AtomicU8`), and ADSR
+  params (`AtomicU64`, packed). Contains the `Waveform` enum.
 - `src/envelope.rs` — ADSR envelope generator. Per-sample state machine (Idle → Attack →
   Decay → Sustain → Release → Idle). Lives inside the audio callback closure.
 - `src/keyboard.rs` — Reads raw keyboard events from Linux evdev (`/dev/input/`).
@@ -25,15 +27,19 @@ See PLAN.md for the roadmap and current progress.
 
 - **evdev over terminal input**: Terminals don't send key release events. We read
   `/dev/input/` directly for true press/release, which requires the `input` group.
-- **Atomic frequency (not mutex)**: The audio callback is real-time — it must never block.
-  We use `AtomicU32` with f32 bit patterns instead of a `Mutex<f32>`.
+- **Lock-free polyphony**: 8 voices, each with its own phase/freq/envelope inside the
+  callback. The main thread sends play/release commands via `[AtomicU32; 8]`. The callback
+  reports voice liveness via `[AtomicBool; 8]` — critical distinction: "no pending command"
+  (`CMD_IDLE`) ≠ "voice is free" (`voice_active == false`). Getting this wrong caused all
+  notes to steal voice 0.
 - **Phase accumulation**: Track oscillator phase as 0.0–1.0 and increment by `freq/sample_rate`
   each sample. Avoids floating-point drift that occurs with `sin(2π × freq × t)` over time.
-- **Monophonic with key tracking**: Currently plays one note at a time but tracks all held
-  keys so releasing one key while holding another doesn't cause silence.
+- **Voice allocation**: Main thread maps MIDI notes → voice indices (`HashMap<u8, usize>`).
+  NoteOn finds a free voice (via `voice_active`), NoteOff releases the specific voice.
+  When all 8 voices are busy, voice 0 is stolen.
 - **ADSR via packed AtomicU64**: Four f32 params are quantized to u16 and packed into a
-  single u64 for atomic transfer to the audio callback. The envelope state machine runs
-  per-sample inside the callback; the main thread only sends gate on/off and param updates.
+  single u64 for atomic transfer. Each voice has its own envelope state machine.
+- **Gain staging**: Voices are summed and scaled by `0.4 / √8` to prevent clipping.
 - **Live area redraw**: Each mode has a fixed-height region that redraws in place via
   cursor-up. Mode switches clear the entire screen (`\x1b[2J\x1b[H`).
 - **Raw mode newlines**: Headers printed before raw mode use `println!`. Headers printed
@@ -54,4 +60,4 @@ See PLAN.md for the roadmap and current progress.
 
 ## What's Next
 
-Check PLAN.md — Phases 1-3 are complete. Next phase is polyphony (playing chords).
+Check PLAN.md — Phases 1-4 are complete. Next phase is filters & subtractive synthesis.

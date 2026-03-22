@@ -155,6 +155,11 @@ impl Envelope {
         self.stage == Stage::Idle
     }
 
+    /// Get the sample rate this envelope was created with.
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
     fn start_decay(&mut self) {
         self.stage = Stage::Decay;
         let decay_samples = self.params.decay * self.sample_rate;
