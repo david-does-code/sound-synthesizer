@@ -1,4 +1,5 @@
 use crate::audio::Waveform;
+use crate::envelope::AdsrParams;
 
 /// Width of the waveform display in terminal columns.
 /// Each braille character encodes a 2-wide × 4-tall dot grid,
@@ -36,36 +37,34 @@ fn braille_bit(row: usize, col: usize) -> u8 {
     }
 }
 
-/// Render one cycle of the given waveform as a string of braille lines.
-/// Returns a Vec of strings, one per display row.
-pub fn render_waveform(waveform: Waveform) -> Vec<String> {
-    let dot_cols = WIDTH * 2;
-    let dot_rows = HEIGHT * 4;
+/// Plot a series of (x, y) points where y is 0.0–1.0 (0=bottom, 1=top)
+/// into braille lines. Shared by both waveform and envelope renderers.
+fn render_braille(samples: &[(f32, f32)], width: usize, height: usize) -> Vec<String> {
+    let dot_cols = width * 2;
+    let dot_rows = height * 4;
 
-    // A 2D grid of braille cells, storing the accumulated bits
-    let mut grid = vec![vec![0u8; WIDTH]; HEIGHT];
+    let mut grid = vec![vec![0u8; width]; height];
 
-    // Sample one full cycle of the waveform across the display width
-    for dx in 0..dot_cols {
-        let phase = dx as f32 / dot_cols as f32;
-        let sample = waveform.sample(phase); // -1.0 to 1.0
+    for &(x_frac, y_val) in samples {
+        let dx = (x_frac * (dot_cols - 1) as f32)
+            .round()
+            .clamp(0.0, (dot_cols - 1) as f32) as usize;
 
-        // Map sample value to a dot row (0 = top, dot_rows-1 = bottom)
-        // -1.0 → bottom, +1.0 → top
-        let y = ((1.0 - sample) * 0.5 * (dot_rows - 1) as f32)
+        // y_val 1.0 = top (row 0), 0.0 = bottom
+        let dy = ((1.0 - y_val) * (dot_rows - 1) as f32)
             .round()
             .clamp(0.0, (dot_rows - 1) as f32) as usize;
 
-        // Which braille cell does this dot land in?
         let cell_col = dx / 2;
-        let cell_row = y / 4;
+        let cell_row = dy / 4;
         let dot_col = dx % 2;
-        let dot_row = y % 4;
+        let dot_row = dy % 4;
 
-        grid[cell_row][cell_col] |= braille_bit(dot_row, dot_col);
+        if cell_col < width && cell_row < height {
+            grid[cell_row][cell_col] |= braille_bit(dot_row, dot_col);
+        }
     }
 
-    // Convert the bit grid to braille characters
     grid.iter()
         .map(|row| {
             row.iter()
@@ -75,3 +74,76 @@ pub fn render_waveform(waveform: Waveform) -> Vec<String> {
         .collect()
 }
 
+/// Render one cycle of the given waveform as braille lines.
+pub fn render_waveform(waveform: Waveform) -> Vec<String> {
+    let dot_cols = WIDTH * 2;
+    let samples: Vec<(f32, f32)> = (0..dot_cols)
+        .map(|dx| {
+            let phase = dx as f32 / dot_cols as f32;
+            let sample = waveform.sample(phase); // -1.0 to 1.0
+            // Map to 0.0–1.0 range for the renderer
+            (phase, (sample + 1.0) * 0.5)
+        })
+        .collect();
+
+    render_braille(&samples, WIDTH, HEIGHT)
+}
+
+/// Render the ADSR envelope shape as braille lines.
+///
+/// The display is divided proportionally:
+/// - Attack ramp (0 → 1.0)
+/// - Decay slope (1.0 → sustain)
+/// - Sustain flat (held at sustain level, ~40% of display width)
+/// - Release slope (sustain → 0)
+pub fn render_envelope(params: &AdsrParams) -> Vec<String> {
+    let dot_cols = WIDTH * 2;
+
+    // Allocate horizontal space proportionally to the time values,
+    // with sustain getting a fixed portion since it's a level, not a time.
+    let total_time = params.attack + params.decay + params.release;
+    let sustain_frac = 0.35; // sustain always gets 35% of display width
+    let time_frac = 1.0 - sustain_frac;
+
+    let attack_frac = if total_time > 0.0 {
+        (params.attack / total_time) * time_frac
+    } else {
+        0.1
+    };
+    let decay_frac = if total_time > 0.0 {
+        (params.decay / total_time) * time_frac
+    } else {
+        0.1
+    };
+    let release_frac = if total_time > 0.0 {
+        (params.release / total_time) * time_frac
+    } else {
+        0.1
+    };
+
+    let mut samples = Vec::with_capacity(dot_cols);
+
+    for dx in 0..dot_cols {
+        let x = dx as f32 / dot_cols as f32;
+        let y = if x < attack_frac {
+            // Attack: ramp 0 → 1
+            x / attack_frac
+        } else if x < attack_frac + decay_frac {
+            // Decay: ramp 1 → sustain
+            let t = (x - attack_frac) / decay_frac;
+            1.0 - t * (1.0 - params.sustain)
+        } else if x < attack_frac + decay_frac + sustain_frac {
+            // Sustain: flat at sustain level
+            params.sustain
+        } else {
+            // Release: ramp sustain → 0
+            let release_start = attack_frac + decay_frac + sustain_frac;
+            let t = (x - release_start) / release_frac;
+            params.sustain * (1.0 - t.clamp(0.0, 1.0))
+        };
+
+        samples.push((dx as f32 / dot_cols as f32, y.clamp(0.0, 1.0)));
+    }
+
+    render_braille(&samples, WIDTH, HEIGHT)
+}

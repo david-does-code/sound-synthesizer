@@ -1,6 +1,7 @@
+use crate::envelope::{AdsrParams, Envelope};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// The available waveform types.
@@ -51,30 +52,14 @@ impl Waveform {
     }
 
     /// Generate a sample for this waveform at the given phase (0.0 to 1.0).
-    ///
-    /// Phase represents position within one cycle of the wave:
-    ///   0.0 = start of cycle
-    ///   0.5 = halfway through
-    ///   1.0 = end (wraps back to 0.0)
     pub fn sample(self, phase: f32) -> f32 {
         match self {
-            Waveform::Sine => {
-                // sin(2π × phase) — a smooth curve
-                (phase * TAU).sin()
-            }
+            Waveform::Sine => (phase * TAU).sin(),
             Waveform::Square => {
-                // +1 for the first half of the cycle, -1 for the second.
-                // This abrupt transition is what creates all those odd harmonics.
                 if phase < 0.5 { 1.0 } else { -1.0 }
             }
-            Waveform::Sawtooth => {
-                // Ramps linearly from -1 to +1 over one cycle, then snaps back.
-                // The sharp discontinuity at the reset creates rich harmonics.
-                2.0 * phase - 1.0
-            }
+            Waveform::Sawtooth => 2.0 * phase - 1.0,
             Waveform::Triangle => {
-                // Ramps up for half the cycle, then ramps down.
-                // The smooth-ish shape means harmonics fall off quickly (1/n²).
                 if phase < 0.5 {
                     4.0 * phase - 1.0
                 } else {
@@ -86,42 +71,57 @@ impl Waveform {
 }
 
 /// Converts a MIDI note number to a frequency in Hz.
-///
-/// MIDI note 69 = A4 = 440 Hz. Each semitone is one MIDI note.
-/// The formula: freq = 440 × 2^((note - 69) / 12)
-///
-/// This is the equal temperament tuning system, where every semitone
-/// has the same frequency ratio. It's a compromise — pure intervals
-/// like perfect fifths are slightly "off" compared to just intonation,
-/// but it lets you play in any key without retuning.
 pub fn midi_to_freq(note: u8) -> f32 {
     440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0)
 }
 
 /// Convert a MIDI note number to a human-readable name like "C4" or "F#5".
-///
-/// The 12 notes in Western music repeat every octave. MIDI note 0 is C-1,
-/// MIDI 60 is C4 (middle C), MIDI 69 is A4 (440 Hz).
 const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 pub fn midi_to_name(note: u8) -> String {
     let name = NOTE_NAMES[(note % 12) as usize];
-    let octave = (note as i16 / 12) - 1; // MIDI 0 = C-1
+    let octave = (note as i16 / 12) - 1;
     format!("{name}{octave}")
 }
 
-/// A real-time audio engine that plays a single note at a time.
+/// Pack four f32 ADSR params into a single u64 for atomic transfer.
+/// Each param is quantized to a u16 (0–65535) which gives us more than
+/// enough precision for audio parameters.
+fn pack_adsr(params: &AdsrParams) -> u64 {
+    let a = (params.attack * 10000.0) as u16;  // 0–6.5535s range, 0.1ms precision
+    let d = (params.decay * 10000.0) as u16;
+    let s = (params.sustain * 65535.0) as u16;  // 0.0–1.0 range, full u16 precision
+    let r = (params.release * 10000.0) as u16;
+    ((a as u64) << 48) | ((d as u64) << 32) | ((s as u64) << 16) | (r as u64)
+}
+
+fn unpack_adsr(packed: u64) -> AdsrParams {
+    let a = ((packed >> 48) & 0xFFFF) as u16;
+    let d = ((packed >> 32) & 0xFFFF) as u16;
+    let s = ((packed >> 16) & 0xFFFF) as u16;
+    let r = (packed & 0xFFFF) as u16;
+    AdsrParams {
+        attack: a as f32 / 10000.0,
+        decay: d as f32 / 10000.0,
+        sustain: s as f32 / 65535.0,
+        release: r as f32 / 10000.0,
+    }
+}
+
+/// A real-time audio engine that plays a single note at a time with ADSR envelope.
 ///
-/// Uses atomics to communicate from the main thread to the audio callback
-/// thread — lock-free and safe for real-time audio where blocking (mutexes)
-/// can cause glitches.
+/// Communication between the main thread and the audio callback is entirely
+/// lock-free using atomics:
+/// - `frequency`: AtomicU32 (f32 bit pattern) for the note pitch
+/// - `waveform`: AtomicU8 for the waveform type
+/// - `gate`: AtomicBool for note on/off (triggers envelope)
+/// - `adsr_packed`: AtomicU64 for ADSR parameters
 pub struct AudioEngine {
     _stream: cpal::Stream,
-    /// Current frequency to play. 0 = silence.
-    /// We use AtomicU32 with f32 bit patterns because there's no AtomicF32.
     frequency: Arc<AtomicU32>,
-    /// Current waveform type, as a u8 matching the Waveform repr.
     waveform: Arc<AtomicU8>,
+    gate: Arc<AtomicBool>,
+    adsr_packed: Arc<AtomicU64>,
 }
 
 impl AudioEngine {
@@ -137,13 +137,23 @@ impl AudioEngine {
         let sample_rate = config.sample_rate().0 as f32;
         let channels = config.channels() as usize;
 
-        let frequency = Arc::new(AtomicU32::new(0u32)); // 0 = silence
+        let frequency = Arc::new(AtomicU32::new(0u32));
         let freq_clone = frequency.clone();
 
         let waveform = Arc::new(AtomicU8::new(Waveform::Sine as u8));
         let wave_clone = waveform.clone();
 
+        let gate = Arc::new(AtomicBool::new(false));
+        let gate_clone = gate.clone();
+
+        let default_params = AdsrParams::default();
+        let adsr_packed = Arc::new(AtomicU64::new(pack_adsr(&default_params)));
+        let adsr_clone = adsr_packed.clone();
+
         let mut phase: f32 = 0.0;
+        let mut envelope = Envelope::new(sample_rate);
+        let mut prev_gate = false;
+        let mut prev_adsr_packed = pack_adsr(&default_params);
 
         let stream = device
             .build_output_stream(
@@ -152,17 +162,37 @@ impl AudioEngine {
                     let freq_bits = freq_clone.load(Ordering::Relaxed);
                     let freq = f32::from_bits(freq_bits);
                     let wave = Waveform::from_u8(wave_clone.load(Ordering::Relaxed));
+                    let gate_on = gate_clone.load(Ordering::Relaxed);
+
+                    // Check if ADSR params changed
+                    let current_adsr = adsr_clone.load(Ordering::Relaxed);
+                    if current_adsr != prev_adsr_packed {
+                        envelope.set_params(unpack_adsr(current_adsr));
+                        prev_adsr_packed = current_adsr;
+                    }
+
+                    // Detect gate transitions
+                    if gate_on && !prev_gate {
+                        envelope.gate_on();
+                    } else if !gate_on && prev_gate {
+                        envelope.gate_off();
+                    }
+                    prev_gate = gate_on;
 
                     for frame in data.chunks_mut(channels) {
-                        if freq <= 0.0 {
-                            phase = 0.0;
+                        let env_amp = envelope.next_sample();
+
+                        if env_amp <= 0.0 || freq <= 0.0 {
+                            if freq <= 0.0 {
+                                phase = 0.0;
+                            }
                             for sample in frame.iter_mut() {
                                 *sample = 0.0;
                             }
                             continue;
                         }
 
-                        let value = wave.sample(phase) * 0.4;
+                        let value = wave.sample(phase) * env_amp * 0.4;
 
                         for sample in frame.iter_mut() {
                             *sample = value;
@@ -185,33 +215,40 @@ impl AudioEngine {
             _stream: stream,
             frequency,
             waveform,
+            gate,
+            adsr_packed,
         }
     }
 
-    /// Start playing a note (by MIDI number). Pass 0 to stop.
+    /// Start playing a note — sets frequency and opens the gate (triggers attack).
     pub fn play_note(&self, midi_note: u8) {
-        let freq = if midi_note == 0 {
-            0.0
-        } else {
-            midi_to_freq(midi_note)
-        };
-        self.frequency
-            .store(freq.to_bits(), Ordering::Relaxed);
+        let freq = midi_to_freq(midi_note);
+        self.frequency.store(freq.to_bits(), Ordering::Relaxed);
+        self.gate.store(true, Ordering::Relaxed);
     }
 
-    /// Stop playing (silence).
+    /// Release the note — closes the gate (triggers release phase).
+    /// The sound will fade out according to the release time, not stop instantly.
     pub fn stop(&self) {
-        self.frequency.store(0u32, Ordering::Relaxed);
+        self.gate.store(false, Ordering::Relaxed);
     }
 
-    /// Switch to a different waveform.
     pub fn set_waveform(&self, waveform: Waveform) {
-        self.waveform
-            .store(waveform as u8, Ordering::Relaxed);
+        self.waveform.store(waveform as u8, Ordering::Relaxed);
     }
 
-    /// Get the current waveform.
     pub fn waveform(&self) -> Waveform {
         Waveform::from_u8(self.waveform.load(Ordering::Relaxed))
+    }
+
+    /// Update ADSR envelope parameters (takes effect on next note).
+    pub fn set_adsr(&self, params: AdsrParams) {
+        self.adsr_packed.store(pack_adsr(&params), Ordering::Relaxed);
+    }
+
+    /// Get current ADSR parameters.
+    #[allow(dead_code)]
+    pub fn adsr(&self) -> AdsrParams {
+        unpack_adsr(self.adsr_packed.load(Ordering::Relaxed))
     }
 }

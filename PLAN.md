@@ -36,14 +36,18 @@ Each waveform's harmonic recipe: sine (none), square (odd at 1/n), saw (all at 1
 triangle (odd at 1/n²). Octave relationships (each octave doubles frequency, ±12 MIDI notes).
 Evdev scancodes are physical keys, not characters — important for keyboard-layout independence.
 
-### Phase 3: Envelopes (ADSR)
+### Phase 3: Envelopes (ADSR) ✅
 
-- [ ] Implement Attack-Decay-Sustain-Release envelopes
-- [ ] Make notes fade in and out naturally instead of abrupt on/off
-- [ ] Add adjustable envelope parameters
+- [x] Implement Attack-Decay-Sustain-Release envelope state machine
+- [x] Make notes fade in and out naturally instead of abrupt on/off
+- [x] Add adjustable envelope parameters
+- [x] Interactive ADSR editor with braille envelope visualization
+- [x] Live preview — play notes while adjusting parameters
 
-**Concepts to learn**: ADSR model, how real instruments have characteristic amplitude
-shapes (a plucked guitar vs a bowed violin vs a struck piano).
+**Concepts learned**: ADSR model (attack ramp, decay slope, sustain level, release fade),
+how real instruments have characteristic amplitude shapes, gate signal for triggering
+envelope stages, per-sample state machine in the audio callback, lock-free parameter
+transfer via packed AtomicU64.
 
 ### Phase 4: Polyphony
 

@@ -14,6 +14,13 @@ pub enum KeyboardEvent {
     WaveformChange(Waveform),
     OctaveUp,
     OctaveDown,
+    /// Toggle between piano mode and ADSR editor
+    ToggleMode,
+    /// Arrow keys for ADSR editor navigation
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
     Quit,
 }
 
@@ -104,22 +111,42 @@ pub fn spawn_keyboard_listener() -> mpsc::Receiver<KeyboardEvent> {
                                 return;
                             }
 
-                            // Control keys (press only, ignore repeat)
-                            if value == 1 {
-                                let control_event = match key {
-                                    Key::KEY_1 => Some(KeyboardEvent::WaveformChange(Waveform::Sine)),
-                                    Key::KEY_2 => Some(KeyboardEvent::WaveformChange(Waveform::Square)),
-                                    Key::KEY_3 => Some(KeyboardEvent::WaveformChange(Waveform::Sawtooth)),
-                                    Key::KEY_4 => Some(KeyboardEvent::WaveformChange(Waveform::Triangle)),
-                                    Key::KEY_Z => Some(KeyboardEvent::OctaveDown),
-                                    Key::KEY_X => Some(KeyboardEvent::OctaveUp),
+                            // Control keys (press only, ignore repeat for most;
+                            // allow repeat for arrow keys so holding adjusts continuously)
+                            if value == 1 || value == 2 {
+                                // Arrow keys: allow both press and repeat
+                                let arrow_event = match key {
+                                    Key::KEY_LEFT => Some(KeyboardEvent::ArrowLeft),
+                                    Key::KEY_RIGHT => Some(KeyboardEvent::ArrowRight),
+                                    Key::KEY_UP => Some(KeyboardEvent::ArrowUp),
+                                    Key::KEY_DOWN => Some(KeyboardEvent::ArrowDown),
                                     _ => None,
                                 };
-                                if let Some(evt) = control_event {
+                                if let Some(evt) = arrow_event {
                                     if tx.send(evt).is_err() {
                                         return;
                                     }
                                     continue;
+                                }
+
+                                // Other control keys: press only (no repeat)
+                                if value == 1 {
+                                    let control_event = match key {
+                                        Key::KEY_1 => Some(KeyboardEvent::WaveformChange(Waveform::Sine)),
+                                        Key::KEY_2 => Some(KeyboardEvent::WaveformChange(Waveform::Square)),
+                                        Key::KEY_3 => Some(KeyboardEvent::WaveformChange(Waveform::Sawtooth)),
+                                        Key::KEY_4 => Some(KeyboardEvent::WaveformChange(Waveform::Triangle)),
+                                        Key::KEY_Z => Some(KeyboardEvent::OctaveDown),
+                                        Key::KEY_X => Some(KeyboardEvent::OctaveUp),
+                                        Key::KEY_TAB => Some(KeyboardEvent::ToggleMode),
+                                        _ => None,
+                                    };
+                                    if let Some(evt) = control_event {
+                                        if tx.send(evt).is_err() {
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                 }
                             }
 

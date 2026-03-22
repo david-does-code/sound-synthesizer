@@ -20,10 +20,18 @@ The synthesizer generates audio in real time by computing waveform samples in an
 
 ### Controls
 
+**Piano mode:**
 - **A-L / W-P** — Play notes (piano layout)
 - **1-4** — Switch waveform: Sine, Square, Sawtooth, Triangle
 - **Z / X** — Octave down / up (range: -3 to +3)
+- **Tab** — Switch to ADSR envelope editor
 - **ESC** — Quit
+
+**ADSR editor mode:**
+- **Left / Right** — Select parameter (Attack, Decay, Sustain, Release)
+- **Up / Down** — Adjust selected value
+- **A-L / W-P** — Play notes to preview the envelope
+- **Tab** — Return to piano mode
 
 ### Waveforms
 
@@ -36,7 +44,11 @@ Each waveform has a different harmonic profile, giving it a distinct character:
 | 3 | Sawtooth | Bright, buzzy — all harmonics (1/n) |
 | 4 | Triangle | Soft, warm — odd harmonics (1/n²) |
 
-A live braille-character waveform visualization updates in the terminal as you switch between waveforms.
+Live braille-character visualizations update in the terminal for both the waveform shape and ADSR envelope curve.
+
+### ADSR Envelope
+
+Notes are shaped by an Attack-Decay-Sustain-Release envelope instead of playing at constant volume. Press **Tab** to open the interactive ADSR editor where you can adjust each parameter with arrow keys and see the envelope shape update in real time. Hold note keys to preview how the envelope sounds.
 
 ## Requirements
 
@@ -59,18 +71,19 @@ cargo run
 
 ```
 src/
-├── main.rs        — Terminal UI and event loop
+├── main.rs        — Terminal UI, event loop, two-mode interface (piano + ADSR editor)
 ├── audio.rs       — Real-time audio engine (oscillator, waveforms, MIDI-to-frequency)
+├── envelope.rs    — ADSR envelope generator (per-sample state machine)
 ├── keyboard.rs    — Evdev keyboard listener (press/release detection)
 ├── notes.rs       — Keyboard layout diagram
-└── visualizer.rs  — Braille-character waveform renderer
+└── visualizer.rs  — Braille-character renderer (waveforms + envelope curves)
 ```
 
 ## Architecture
 
-- **Audio thread** (cpal callback): Generates samples at 44.1kHz. Reads the target frequency and waveform type from atomic variables — lock-free, no mutex, no risk of audio glitches from blocking.
-- **Keyboard thread** (evdev): Reads raw input events from `/dev/input/` and sends `NoteOn`/`NoteOff`/`WaveformChange`/`OctaveUp`/`OctaveDown` messages over an MPSC channel.
-- **Main thread**: Connects keyboard events to the audio engine. Tracks held keys for smooth transitions, manages octave offset, redraws the waveform visualization in place using ANSI cursor control.
+- **Audio thread** (cpal callback): Generates samples at 44.1kHz. Reads frequency, waveform, gate signal, and ADSR parameters from atomic variables — all lock-free. The ADSR envelope state machine runs per-sample inside the callback.
+- **Keyboard thread** (evdev): Reads raw input events from `/dev/input/` and sends note, waveform, octave, mode, and arrow key events over an MPSC channel.
+- **Main thread**: Two-mode UI (piano + ADSR editor). Tracks held keys for smooth transitions, manages octave offset, and redraws visualizations using ANSI cursor control.
 
 ## Roadmap
 
