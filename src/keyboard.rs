@@ -1,3 +1,4 @@
+use crate::audio::Waveform;
 use evdev::{Device, InputEventKind, Key};
 use std::sync::mpsc;
 use std::thread;
@@ -5,8 +6,14 @@ use std::thread;
 /// Events our keyboard reader sends to the main loop.
 #[derive(Debug)]
 pub enum KeyboardEvent {
-    NoteOn { midi: u8, name: &'static str },
-    NoteOff { midi: u8 },
+    /// A note key was pressed. `base_midi` is the MIDI note at octave 4
+    /// (before octave offset is applied). The main loop adds the offset.
+    NoteOn { base_midi: u8 },
+    /// A note key was released.
+    NoteOff { base_midi: u8 },
+    WaveformChange(Waveform),
+    OctaveUp,
+    OctaveDown,
     Quit,
 }
 
@@ -97,14 +104,33 @@ pub fn spawn_keyboard_listener() -> mpsc::Receiver<KeyboardEvent> {
                                 return;
                             }
 
-                            if let Some((midi, name)) = evdev_key_to_note(key) {
+                            // Control keys (press only, ignore repeat)
+                            if value == 1 {
+                                let control_event = match key {
+                                    Key::KEY_1 => Some(KeyboardEvent::WaveformChange(Waveform::Sine)),
+                                    Key::KEY_2 => Some(KeyboardEvent::WaveformChange(Waveform::Square)),
+                                    Key::KEY_3 => Some(KeyboardEvent::WaveformChange(Waveform::Sawtooth)),
+                                    Key::KEY_4 => Some(KeyboardEvent::WaveformChange(Waveform::Triangle)),
+                                    Key::KEY_Z => Some(KeyboardEvent::OctaveDown),
+                                    Key::KEY_X => Some(KeyboardEvent::OctaveUp),
+                                    _ => None,
+                                };
+                                if let Some(evt) = control_event {
+                                    if tx.send(evt).is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            if let Some((midi, _name)) = evdev_key_to_note(key) {
                                 let msg = match value {
-                                    1 => KeyboardEvent::NoteOn { midi, name }, // press
-                                    0 => KeyboardEvent::NoteOff { midi },      // release
-                                    _ => continue, // 2 = repeat, ignore it
+                                    1 => KeyboardEvent::NoteOn { base_midi: midi },
+                                    0 => KeyboardEvent::NoteOff { base_midi: midi },
+                                    _ => continue,
                                 };
                                 if tx.send(msg).is_err() {
-                                    return; // main thread dropped the receiver
+                                    return;
                                 }
                             }
                         }

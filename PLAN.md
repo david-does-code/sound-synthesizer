@@ -23,15 +23,18 @@ inspired by [Sebastian Lague's video on synthesizing musical instruments](https:
 MIDI note numbers, equal temperament tuning, semitones, the piano key layout,
 real-time audio callbacks, lock-free concurrency with atomics.
 
-### Phase 2: Waveforms & Timbre
+### Phase 2: Waveforms & Timbre ✅
 
-- [ ] Add selectable waveforms: square, sawtooth, triangle
-- [ ] Understand why different waveforms sound different (harmonic content)
-- [ ] Visualize waveforms in the terminal
-- [ ] Implement octave shifting (extend playable range)
+- [x] Add selectable waveforms: square, sawtooth, triangle
+- [x] Understand why different waveforms sound different (harmonic content)
+- [x] Visualize waveforms in the terminal (braille-character renderer)
+- [x] Implement octave shifting (Z/X keys, range -3 to +3)
 
-**Concepts to learn**: harmonics and overtones, Fourier series (any waveform is a sum of
+**Concepts learned**: harmonics and overtones, Fourier series (any waveform is a sum of
 sine waves), timbre — why a piano and a flute playing the same note sound different.
+Each waveform's harmonic recipe: sine (none), square (odd at 1/n), saw (all at 1/n),
+triangle (odd at 1/n²). Octave relationships (each octave doubles frequency, ±12 MIDI notes).
+Evdev scancodes are physical keys, not characters — important for keyboard-layout independence.
 
 ### Phase 3: Envelopes (ADSR)
 
