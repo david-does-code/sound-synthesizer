@@ -1,0 +1,10 @@
+[package]
+name = "sound-synthesizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.15"       # Cross-platform audio output
+hound = "3.5"       # WAV file reading/writing
+crossterm = "0.28"  # Terminal raw mode and display
+evdev = "0.12"      # Direct Linux keyboard input (real press/release events)
