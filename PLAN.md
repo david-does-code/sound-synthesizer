@@ -60,37 +60,92 @@ prevent clipping), voice allocation (finding free slots via shared AtomicBool fl
 voice stealing (reusing the oldest voice when all are busy), the distinction between
 "no pending command" and "voice is free" in lock-free designs.
 
-### Phase 5: Filters & Subtractive Synthesis
+### Phase 5: Step Sequencer & Rhythm
 
-- [ ] Implement low-pass, high-pass, and band-pass filters
-- [ ] Build a subtractive synthesizer (start with rich waveform, sculpt with filters)
-- [ ] Add filter cutoff and resonance controls
+Build a step sequencer — a grid where each row is a sound and each column is a beat.
+Classic drum machine style (TR-808). This is the foundation for making actual music.
 
-**Concepts to learn**: frequency spectrum, filter types and their effect on timbre,
-subtractive synthesis (the approach used by classic analog synths like the Moog).
+- [ ] BPM / tempo clock that ticks at a steady rate
+- [ ] 16-step pattern grid — toggle steps on/off per sound
+- [ ] Visual grid in the TUI — see the playhead move across beats
+- [ ] Play/pause/stop controls
+- [ ] Text-based pattern file format (load/save)
 
-### Phase 6: Effects
+**Concepts to learn**: tempo and BPM, beats and bars, time signatures (4/4, 3/4),
+subdivisions (8th notes, 16th notes), swing/shuffle, the rhythmic grid that
+underpins all western music.
 
+### Phase 6: Sampling & Drum Kits
+
+Load WAV files as sound sources instead of only generating waveforms. Combine with
+the sequencer to make drum patterns with real sounds.
+
+- [ ] Load short WAV samples (kick, snare, hi-hat, clap, etc.)
+- [ ] Pitch-shift samples to play them at different notes
+- [ ] Mix synth voices + samples together in the sequencer
+- [ ] Bundle a basic drum kit (freely licensed samples)
+
+**Concepts to learn**: PCM audio and sample playback, pitch-frequency relationship,
+drum kit anatomy (kick grounds the beat, snare marks the backbeat, hi-hat drives
+rhythm), layering sounds.
+
+### Phase 7: Melody, Chords & Composition
+
+Layer melodic and harmonic patterns over drums. Chain patterns into songs.
+Support text-based composition so both humans and Claude can write music.
+
+- [ ] Melodic tracks using note names (C4, Eb3, F#5)
+- [ ] Chord shorthand that expands to notes (Cm, G7, Dmaj)
+- [ ] Multiple pattern tracks — drums + bass + lead
+- [ ] Pattern chaining — arrange patterns into a song (intro → verse → chorus)
+- [ ] Quantization — snap live-played notes to the grid
+- [ ] Export full compositions to WAV
+
+**Concepts to learn**: scales and keys (major/minor), intervals, chord construction
+(triads, 7ths), chord progressions (I-IV-V-I, ii-V-I, 12-bar blues), song structure
+(verse, chorus, bridge), the role of bass vs lead, call-and-response.
+
+### Pattern File Format
+
+Human-readable text files that both the TUI and Claude can read/write:
+
+```
+bpm: 120
+time: 4/4
+key: C minor
+
+[drums]
+kick:    x---x---x---x---
+snare:   ----x-------x---
+hihat:   x-x-x-x-x-x-x-x-
+
+[bass]
+notes:   C2--G2--Ab2-Eb2-
+
+[lead]
+notes:   .---Eb4G4Ab4-G4--
+```
+
+This enables Claude to generate patterns from chord sheets, lead sheets, or
+descriptions like "write me a 12-bar blues in E".
+
+### Phase 8: Filters & Effects
+
+Once there's actual music to process, add filters and effects as creative tools.
+
+- [ ] Low-pass / high-pass filters with cutoff and resonance
 - [ ] Delay / echo
-- [ ] Reverb (simulating room acoustics)
-- [ ] Chorus / detune
+- [ ] Reverb
+- [ ] Per-track filter and effect controls
 
-**Concepts to learn**: delay lines, convolution, feedback loops, how physical spaces
-shape sound.
-
-### Phase 7: Instrument Synthesis
-
-- [ ] Use additive synthesis to approximate real instruments
-- [ ] Combine oscillators, envelopes, and filters to create presets
-- [ ] Record and export compositions to WAV
-
-**Concepts to learn**: spectral analysis of real instruments, formants, how to
-decompose and reconstruct the character of an instrument from its harmonics.
+**Concepts to learn**: frequency spectrum, filter types, subtractive synthesis,
+delay lines, feedback loops, how physical spaces shape sound.
 
 ## Stretch Goals
 
 - [ ] Full TUI with ratatui (waveform display, knobs, keyboard visualization)
 - [ ] MIDI input support (connect a real MIDI keyboard)
-- [ ] Sequencer / pattern editor
 - [ ] Wavetable synthesis
 - [ ] FM synthesis
+- [ ] Import chord sheets / lead sheets from text
+- [ ] Live recording — play into the sequencer in real time
