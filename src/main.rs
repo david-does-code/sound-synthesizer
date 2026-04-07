@@ -2,6 +2,8 @@ mod audio;
 mod envelope;
 mod keyboard;
 mod notes;
+mod pattern;
+mod sequencer;
 mod visualizer;
 
 use audio::{AudioEngine, Waveform};
@@ -9,6 +11,8 @@ use crossterm::terminal;
 use envelope::AdsrParams;
 use keyboard::{spawn_keyboard_listener, KeyboardEvent};
 use notes::keyboard_help;
+use pattern::Pattern;
+use sequencer::Sequencer;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -63,6 +67,18 @@ const PIANO_LIVE_ROWS: u16 = VIS_ROWS + 2;
 const ADSR_LIVE_ROWS: u16 = VIS_ROWS + 6;
 
 fn main() {
+    // CLI: `--play <file.pat>` plays a pattern from disk and exits when you press Enter.
+    // No flag = the existing interactive piano.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--play" {
+        play_pattern(&args[2]);
+        return;
+    }
+    if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
+        print_cli_help();
+        return;
+    }
+
     let engine = AudioEngine::new();
 
     // Print the initial header BEFORE raw mode so newlines work normally
@@ -388,4 +404,65 @@ fn write_adsr_content(stdout: &mut io::Stdout, adsr: &AdsrParams, selected: Adsr
     write!(stdout, "\r\n").ok();
     write!(stdout, "\r  ◀/▶ Select   ▲/▼ Adjust   [Tab] Back to piano       \r\n").ok();
     write!(stdout, "\r{:65}\r\n", "").ok();
+}
+
+// ─── Pattern playback (CLI) ────────────────────────────────────────
+
+fn print_cli_help() {
+    println!("Sound Synthesizer");
+    println!();
+    println!("Usage:");
+    println!("  cargo run                       Interactive keyboard piano");
+    println!("  cargo run -- --play <file.pat>  Play a pattern file in a loop");
+    println!("  cargo run -- --help             Show this help");
+}
+
+fn play_pattern(path: &str) {
+    let pattern = match Pattern::from_file(path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to load pattern '{path}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("  🥁 Playing {path}");
+    println!("  ────────────────────────────────────────");
+    println!("  Tempo: {} BPM", pattern.bpm);
+    println!("  Steps: {}", pattern.steps);
+    println!("  Tracks:");
+    for t in &pattern.tracks {
+        let recognized = matches!(
+            t.name.to_ascii_lowercase().as_str(),
+            "kick" | "bd" | "bassdrum" | "snare" | "sd" | "hihat" | "hh" | "hat" | "closedhat"
+        );
+        let marker = if recognized { "♪" } else { "·" };
+        let visual: String = t.hits.iter().map(|h| if *h { 'x' } else { '-' }).collect();
+        println!("    {marker} {:<8} {}", t.name, visual);
+    }
+    println!();
+    println!("  Press Enter to stop.");
+
+    let engine = AudioEngine::new();
+    let drum_handle = engine.drum_handle();
+
+    // Diagnostic: show timing math so we can spot any device-specific issue.
+    let sample_rate = drum_handle.sample_rate() as f64;
+    let step_secs = 60.0 / pattern.bpm as f64 / 4.0;
+    let samples_per_step = (step_secs * sample_rate).round() as u64;
+    let bar_secs = step_secs * pattern.steps as f64;
+    println!(
+        "  audio: {sample_rate} Hz   step: {:.3} ms ({samples_per_step} samples)   bar: {bar_secs:.3} s",
+        step_secs * 1000.0
+    );
+    println!();
+
+    let mut seq = Sequencer::new(pattern, drum_handle);
+    seq.start();
+
+    let mut buf = String::new();
+    let _ = io::stdin().read_line(&mut buf);
+
+    seq.stop();
+    println!("  Stopped.");
 }

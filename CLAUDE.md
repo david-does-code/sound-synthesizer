@@ -7,21 +7,33 @@ See PLAN.md for the roadmap and current progress.
 
 ## Architecture
 
-- `src/audio.rs` — Polyphonic audio engine with 8 voices. Each voice has its own oscillator
-  and ADSR envelope inside the callback closure. Communication is lock-free via:
-  `voice_commands` (`[AtomicU32; 8]` for play/release), `voice_active` (`[AtomicBool; 8]`
-  for the callback to report which voices are sounding), waveform (`AtomicU8`), and ADSR
-  params (`AtomicU64`, packed). Contains the `Waveform` enum.
+- `src/audio.rs` — Polyphonic audio engine with 8 pitched voices plus 3 dedicated drum
+  voices (kick, snare, hi-hat) synthesized inside the callback. Lock-free communication:
+  `voice_commands` (`[AtomicU32; 8]` for play/release), `voice_active` (`[AtomicBool; 8]`),
+  waveform (`AtomicU8`), ADSR params (packed `AtomicU64`), `drum_schedule` (`[AtomicU64; 3]`
+  holding absolute audio sample numbers for sample-accurate drum triggers), and `sample_clock`
+  (`AtomicU64`, advanced per-frame by the callback). Contains `Waveform`, `Drum`, `DrumVoice`,
+  and `DrumHandle` (a clonable Send + Sync handle for the sequencer).
 - `src/envelope.rs` — ADSR envelope generator. Per-sample state machine (Idle → Attack →
   Decay → Sustain → Release → Idle). Lives inside the audio callback closure.
 - `src/keyboard.rs` — Reads raw keyboard events from Linux evdev (`/dev/input/`).
   Sends note, waveform, octave, mode toggle, and arrow key events over an MPSC channel.
-- `src/main.rs` — Two-mode UI: piano mode and ADSR editor. Tab toggles between them.
-  Mode switch clears screen (`\x1b[2J\x1b[H`) and redraws. Each mode has its own
-  "live area" that redraws in place with cursor-up.
+- `src/pattern.rs` — Pattern file format and parser. Defines `Pattern`, `Track`, and
+  `PatternParseError`. Format is line-based: `bpm:`/`steps:` headers, then `name: x---x---`
+  rows. Comments with `#`, blank lines ignored, `x`/`X` = hit, `-`/`.` = rest. Parser
+  errors carry line numbers.
+- `src/sequencer.rs` — Step sequencer that plays a `Pattern` via a background thread.
+  Uses sample-accurate scheduling: pre-computes the absolute audio sample for each step
+  and writes it to `DrumHandle::schedule_at`, so playback timing is independent of the
+  scheduler thread's wall-clock jitter. Track names map to drum kinds (kick/bd, snare/sd,
+  hihat/hh/hat). Lookahead is ~100 ms.
+- `src/main.rs` — Two interactive modes (piano + ADSR editor, Tab toggles) plus a CLI
+  pattern player: `cargo run -- --play <file.pat>` loads a pattern and plays it in a
+  loop until Enter is pressed. `--help` lists usage.
 - `src/visualizer.rs` — Renders waveforms and ADSR envelopes using Unicode braille characters
   (2×4 dot grid per character). Shared `render_braille` function for both.
 - `src/notes.rs` — Keyboard layout diagram.
+- `patterns/` — Example `.pat` files (`four_on_the_floor.pat` and diagnostic patterns).
 
 ## Key Design Decisions
 
@@ -40,6 +52,17 @@ See PLAN.md for the roadmap and current progress.
 - **ADSR via packed AtomicU64**: Four f32 params are quantized to u16 and packed into a
   single u64 for atomic transfer. Each voice has its own envelope state machine.
 - **Gain staging**: Voices are summed and scaled by `0.4 / √8` to prevent clipping.
+  Drums are mixed in separately at 0.5 gain on top of the pitched voices.
+- **Drum synthesis recipes**: Each drum is a tiny formula run per sample. Kick = pitch-swept
+  sine (150 Hz → 40 Hz, exp decay). Snare = white noise + 180 Hz body tone. HiHat = fast-
+  decaying noise. Each voice deactivates only once amplitude falls below 0.001 (no hard
+  time cutoff — that caused tail clicks at exactly the inter-hit interval).
+- **Sample-accurate sequencer scheduling**: The sequencer writes absolute sample numbers
+  to per-drum atomic slots; the audio callback compares against `sample_clock` each frame
+  and triggers when the time arrives. The wall-clock sleep in the sequencer thread only
+  controls *when* events get scheduled, not *when* they play. ~100 ms of lookahead is
+  needed to absorb audio buffer batching (smaller lookahead caused occasional late hits
+  on Linux desktop audio).
 - **Live area redraw**: Each mode has a fixed-height region that redraws in place via
   cursor-up. Mode switches clear the entire screen (`\x1b[2J\x1b[H`).
 - **Raw mode newlines**: Headers printed before raw mode use `println!`. Headers printed
@@ -60,4 +83,7 @@ See PLAN.md for the roadmap and current progress.
 
 ## What's Next
 
-Check PLAN.md — Phases 1-4 are complete. Next phase is filters & subtractive synthesis.
+Check PLAN.md — Phases 1-4 are complete. Phase 5 is in progress: step sequencer with
+text-based pattern files. Slices 1-2 done (parser + sequencer engine + drum synthesis +
+`--play` CLI). Next slice: melodic note tracks so the format can express bass/lead
+lines, then chord shorthand, then a TUI grid view.

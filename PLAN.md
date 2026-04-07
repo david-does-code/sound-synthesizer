@@ -60,20 +60,26 @@ prevent clipping), voice allocation (finding free slots via shared AtomicBool fl
 voice stealing (reusing the oldest voice when all are busy), the distinction between
 "no pending command" and "voice is free" in lock-free designs.
 
-### Phase 5: Step Sequencer & Rhythm
+### Phase 5: Step Sequencer & Rhythm 🚧
 
 Build a step sequencer — a grid where each row is a sound and each column is a beat.
 Classic drum machine style (TR-808). This is the foundation for making actual music.
 
-- [ ] BPM / tempo clock that ticks at a steady rate
-- [ ] 16-step pattern grid — toggle steps on/off per sound
+- [x] Text-based pattern file format with parser (`src/pattern.rs`)
+- [x] Synthesized drum voices (kick / snare / hi-hat) inside the audio engine
+- [x] BPM / tempo clock with sample-accurate scheduling (`src/sequencer.rs`)
+- [x] CLI pattern player: `cargo run -- --play <file.pat>`
 - [ ] Visual grid in the TUI — see the playhead move across beats
-- [ ] Play/pause/stop controls
-- [ ] Text-based pattern file format (load/save)
+- [ ] Play/pause/stop controls in the TUI
+- [ ] Edit / save patterns interactively in the TUI
 
-**Concepts to learn**: tempo and BPM, beats and bars, time signatures (4/4, 3/4),
-subdivisions (8th notes, 16th notes), swing/shuffle, the rhythmic grid that
-underpins all western music.
+**Concepts learned so far**: tempo and BPM, beats and bars, 16th-note subdivisions in
+4/4, drum kit anatomy (kick on the downbeat, snare on the backbeat, hi-hat driving
+8ths), four-on-the-floor as the canonical dance rhythm, drum synthesis from primitives
+(pitch-swept sine for kick, noise + body tone for snare), why hard time-cutoffs cause
+clicks (discontinuity at non-zero amplitude), and sample-accurate scheduling vs.
+wall-clock scheduling — the latter suffers from audio buffer jitter that the ear can
+hear as one beat being "off".
 
 ### Phase 6: Sampling & Drum Kits
 

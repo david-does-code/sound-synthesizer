@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(cargo check *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(ls *)",
+      "Edit(/home/david/Work/personal/learning/sound-synthesizer/**)",
+      "Write(/home/david/Work/personal/learning/sound-synthesizer/**)"
+    ]
+  }
+}
