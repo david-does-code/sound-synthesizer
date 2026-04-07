@@ -1,33 +1,34 @@
 //! Step sequencer — plays a [`Pattern`] in real time with sample-accurate timing.
 //!
-//! Track names map to drum kinds:
+//! Drum tracks are routed by name to one of the synthesized drum voices:
 //!
-//! | Track name(s)         | Drum kind     |
-//! |-----------------------|---------------|
-//! | `kick`, `bd`          | [`Drum::Kick`] |
-//! | `snare`, `sd`         | [`Drum::Snare`] |
-//! | `hihat`, `hh`, `hat`  | [`Drum::HiHat`] |
+//! | Track name(s)         | Drum kind          |
+//! |-----------------------|--------------------|
+//! | `kick`, `bd`          | [`Drum::Kick`]     |
+//! | `snare`, `sd`         | [`Drum::Snare`]    |
+//! | `hihat`, `hh`, `hat`  | [`Drum::HiHat`]    |
 //!
-//! Unrecognized track names are ignored for now (melodic tracks come in slice 4).
+//! Note tracks are assigned a pitched voice each, in the order they appear in
+//! the pattern. With 8 pitched voices total, up to 8 simultaneous note tracks
+//! are supported. Extra note tracks are silently dropped (TODO: warn).
 //!
 //! ## Timing
 //!
-//! Naive `thread::sleep` per step suffers from audio buffer jitter — each
-//! "trigger now" flag waits for the next callback boundary, introducing
-//! several milliseconds of random offset per hit.
+//! Naive `thread::sleep` per step suffers from audio buffer jitter — a "trigger
+//! now" flag waits for the next callback boundary, introducing several
+//! milliseconds of random offset per hit.
 //!
-//! Instead, we use **sample-accurate scheduling**: the sequencer thread
-//! computes the absolute audio sample number for each hit and writes it to
-//! [`DrumHandle`]. The audio callback fires the drum on the exact sample,
-//! independent of when the sequencer thread happened to wake up.
+//! Instead, the sequencer thread uses **sample-accurate scheduling**: it
+//! pre-computes the absolute audio sample for each step and writes it to the
+//! [`EngineHandle`]. The audio callback fires the drum or voice on the exact
+//! sample, independent of when the sequencer thread woke up.
 //!
-//! The sequencer thread uses a small lookahead (~50 ms) so that triggers are
-//! always scheduled before the audio callback would have processed them.
-//! Sleep timing then only affects how often the sequencer thread wakes — never
-//! the audible playback.
+//! A ~100 ms lookahead ensures events are queued well before the audio callback
+//! would have processed them. Sleep timing only affects when scheduling happens,
+//! never when playback happens.
 
-use crate::audio::{Drum, DrumHandle};
-use crate::pattern::Pattern;
+use crate::audio::{Drum, EngineHandle, MAX_VOICES};
+use crate::pattern::{Cell, Pattern, TrackKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -35,16 +36,29 @@ use std::time::{Duration, Instant};
 
 pub struct Sequencer {
     pattern: Pattern,
-    drums: DrumHandle,
+    engine: EngineHandle,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
+/// A track resolved into something the sequencer thread can dispatch directly,
+/// without re-walking the original [`Pattern`] structure on every tick.
+enum ResolvedTrack {
+    Drum {
+        drum: Drum,
+        hits: Vec<bool>,
+    },
+    Notes {
+        voice_idx: usize,
+        cells: Vec<Cell>,
+    },
+}
+
 impl Sequencer {
-    pub fn new(pattern: Pattern, drums: DrumHandle) -> Self {
+    pub fn new(pattern: Pattern, engine: EngineHandle) -> Self {
         Sequencer {
             pattern,
-            drums,
+            engine,
             stop: Arc::new(AtomicBool::new(false)),
             handle: None,
         }
@@ -54,20 +68,44 @@ impl Sequencer {
     /// until [`stop`](Self::stop) is called.
     pub fn start(&mut self) {
         let pattern = self.pattern.clone();
-        let drums = self.drums.clone();
+        let engine = self.engine.clone();
         let stop = self.stop.clone();
 
-        let sample_rate = drums.sample_rate() as f64;
-        // 16th note duration in seconds and in samples.
+        let sample_rate = engine.sample_rate() as f64;
         let step_secs = 60.0 / pattern.bpm as f64 / 4.0;
         let samples_per_step = (step_secs * sample_rate).round() as u64;
 
-        // Pre-resolve track name → drum kind so we don't string-match on every tick.
-        let resolved: Vec<(Option<Drum>, Vec<bool>)> = pattern
-            .tracks
-            .iter()
-            .map(|t| (resolve_drum(&t.name), t.hits.clone()))
-            .collect();
+        // Resolve every track once, up-front. Note tracks consume voice indices
+        // 0..n in the order they appear; tracks beyond MAX_VOICES are dropped.
+        let mut resolved: Vec<ResolvedTrack> = Vec::with_capacity(pattern.tracks.len());
+        let mut next_voice: usize = 0;
+        for track in &pattern.tracks {
+            match &track.kind {
+                TrackKind::Drum(hits) => {
+                    if let Some(drum) = resolve_drum(&track.name) {
+                        resolved.push(ResolvedTrack::Drum {
+                            drum,
+                            hits: hits.clone(),
+                        });
+                    }
+                }
+                TrackKind::Notes(cells) => {
+                    if next_voice >= MAX_VOICES {
+                        eprintln!(
+                            "warning: note track {:?} dropped — only {} pitched voices available",
+                            track.name, MAX_VOICES
+                        );
+                        continue;
+                    }
+                    resolved.push(ResolvedTrack::Notes {
+                        voice_idx: next_voice,
+                        cells: cells.clone(),
+                    });
+                    next_voice += 1;
+                }
+            }
+        }
+
         let total_steps = pattern.steps;
 
         let handle = thread::spawn(move || {
@@ -75,28 +113,39 @@ impl Sequencer {
             // always queued well before the audio callback would have processed
             // them, even on systems with larger audio buffers.
             let lookahead_samples = (sample_rate / 10.0) as u64;
-            let start_sample = drums.current_sample() + lookahead_samples;
+            let start_sample = engine.current_sample() + lookahead_samples;
 
             let scheduling_start = Instant::now();
             let mut step: usize = 0;
             let mut tick: u64 = 0;
 
             while !stop.load(Ordering::Relaxed) {
-                // Compute the exact audio sample for this step.
                 let target_sample = start_sample + tick * samples_per_step;
 
-                // Schedule every drum hit on this step at that exact sample.
-                for (drum_opt, hits) in &resolved {
-                    if let Some(drum) = drum_opt {
-                        if hits[step] {
-                            drums.schedule_at(*drum, target_sample);
+                // Dispatch every track's event for this step.
+                for track in &resolved {
+                    match track {
+                        ResolvedTrack::Drum { drum, hits } => {
+                            if hits[step] {
+                                engine.schedule_at(*drum, target_sample);
+                            }
                         }
+                        ResolvedTrack::Notes { voice_idx, cells } => match cells[step] {
+                            Cell::Note(midi) => {
+                                engine.schedule_note_on(*voice_idx, target_sample, midi);
+                            }
+                            Cell::Rest => {
+                                engine.schedule_note_off(*voice_idx, target_sample);
+                            }
+                            Cell::Sustain => {
+                                // Nothing to do — voice keeps playing.
+                            }
+                        },
                     }
                 }
 
-                // Sleep until just before the next step's scheduling time.
-                // The sleep target is wall-clock based, but the actual playback
-                // timing is sample-accurate regardless of when we wake up.
+                // Sleep until ~when the next step needs scheduling. Wakeup time
+                // is wall-clock based; playback time is sample-accurate.
                 tick += 1;
                 let next_wakeup = scheduling_start
                     + Duration::from_secs_f64(step_secs * tick as f64);
@@ -106,6 +155,14 @@ impl Sequencer {
                 }
 
                 step = (step + 1) % total_steps;
+            }
+
+            // On stop, release any voices we own so they fade out cleanly.
+            let release_at = engine.current_sample() + 1;
+            for track in &resolved {
+                if let ResolvedTrack::Notes { voice_idx, .. } = track {
+                    engine.schedule_note_off(*voice_idx, release_at);
+                }
             }
         });
         self.handle = Some(handle);
@@ -127,7 +184,7 @@ impl Drop for Sequencer {
 }
 
 /// Map a track name to a drum kind. Case-insensitive. Returns `None` for
-/// unknown names (e.g. future melodic tracks).
+/// unknown names.
 fn resolve_drum(name: &str) -> Option<Drum> {
     match name.to_ascii_lowercase().as_str() {
         "kick" | "bd" | "bassdrum" => Some(Drum::Kick),

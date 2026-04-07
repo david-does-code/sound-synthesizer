@@ -93,7 +93,7 @@ fn unpack_adsr(packed: u64) -> AdsrParams {
     }
 }
 
-/// Voice commands sent from main thread → audio callback.
+/// Voice commands sent from main thread → audio callback (immediate, used by piano mode).
 const CMD_IDLE: u32 = 0;
 const CMD_PLAY: u32 = 1;
 const CMD_RELEASE: u32 = 2;
@@ -104,6 +104,30 @@ fn pack_cmd(cmd: u32, midi: u8) -> u32 {
 
 fn unpack_cmd(packed: u32) -> (u32, u8) {
     (packed >> 16, (packed & 0xFF) as u8)
+}
+
+/// Sample-accurate scheduled voice events used by the sequencer.
+///
+/// Packed into a single AtomicU64 so reads/writes are atomic and ordering-free:
+/// - bits  0..48: target audio sample (u48 — ~9 years at 44.1 kHz)
+/// - bits 48..56: MIDI note (u8)
+/// - bits 56..64: event kind (`EVENT_*` below)
+///
+/// Event kind 0 means "slot empty / no pending event".
+const EVENT_NONE: u8 = 0;
+const EVENT_PLAY: u8 = 1;
+const EVENT_RELEASE: u8 = 2;
+
+fn pack_voice_event(kind: u8, target_sample: u64, midi: u8) -> u64 {
+    debug_assert!(target_sample < (1u64 << 48));
+    (target_sample & 0xFFFF_FFFF_FFFF) | ((midi as u64) << 48) | ((kind as u64) << 56)
+}
+
+fn unpack_voice_event(packed: u64) -> (u8, u64, u8) {
+    let target = packed & 0xFFFF_FFFF_FFFF;
+    let midi = ((packed >> 48) & 0xFF) as u8;
+    let kind = ((packed >> 56) & 0xFF) as u8;
+    (kind, target, midi)
 }
 
 /// State for a single drum voice inside the audio callback.
@@ -204,27 +228,31 @@ impl DrumVoice {
     }
 }
 
-/// A clonable, Send + Sync handle for triggering drums with sample-accurate timing.
+/// A clonable, Send + Sync control surface for the audio engine, designed for
+/// sample-accurate scheduling from another thread (the sequencer).
 ///
-/// Holds:
-/// - `schedule`: per-drum AtomicU64 slots holding the absolute audio sample at
-///   which the drum should fire (0 = no pending trigger). The audio callback
-///   reads these every frame and fires when `sample_clock >= target`.
-/// - `sample_clock`: the current audio sample position, written by the callback.
-///   The sequencer reads this to compute future trigger times.
+/// It exposes:
+/// - **Drums** — `schedule_at` writes a drum's target sample into a per-drum slot
+///   that the audio callback checks every frame.
+/// - **Pitched voices** — `schedule_note_on` / `schedule_note_off` write a packed
+///   event (kind, sample, midi) into a per-voice slot, also checked every frame.
+/// - **Clock readout** — `current_sample()` lets the sequencer read the audio
+///   callback's current position so it can compute future sample numbers.
 ///
-/// This eliminates audio-buffer jitter: the sequencer schedules drums in absolute
-/// sample time, and the callback fires them on the exact sample regardless of when
-/// the sequencer thread woke up to schedule them.
+/// Single-slot scheduling means the contract is: **don't schedule a new event for
+/// the same drum/voice until the previous one has fired**. With ~100 ms of
+/// scheduler lookahead and step intervals well above the audio buffer size,
+/// this holds for any reasonable tempo.
 #[derive(Clone)]
-pub struct DrumHandle {
-    schedule: Arc<[AtomicU64; NUM_DRUMS]>,
+pub struct EngineHandle {
+    drum_schedule: Arc<[AtomicU64; NUM_DRUMS]>,
+    voice_events: Arc<[AtomicU64; MAX_VOICES]>,
     sample_clock: Arc<AtomicU64>,
     sample_rate: f32,
 }
 
-impl DrumHandle {
-    /// The current audio sample position.
+impl EngineHandle {
+    /// The current audio sample position (frames generated since stream start).
     pub fn current_sample(&self) -> u64 {
         self.sample_clock.load(Ordering::Relaxed)
     }
@@ -235,16 +263,33 @@ impl DrumHandle {
     }
 
     /// Schedule a drum to fire at the given absolute audio sample number.
-    /// If a previous trigger for this drum hasn't fired yet, it's overwritten.
     pub fn schedule_at(&self, drum: Drum, target_sample: u64) {
         // 0 means "nothing scheduled", so clamp to ≥1.
-        self.schedule[drum as usize].store(target_sample.max(1), Ordering::Relaxed);
+        self.drum_schedule[drum as usize].store(target_sample.max(1), Ordering::Relaxed);
     }
 
     /// Trigger a drum as soon as possible (used for live, non-sequenced playback).
     #[allow(dead_code)]
     pub fn trigger(&self, drum: Drum) {
         self.schedule_at(drum, self.current_sample() + 1);
+    }
+
+    /// Schedule a note-on (gate-on with new pitch) for `voice_idx` at the given
+    /// absolute audio sample. Retriggers the voice if it was already playing.
+    pub fn schedule_note_on(&self, voice_idx: usize, target_sample: u64, midi: u8) {
+        if voice_idx < MAX_VOICES {
+            let packed = pack_voice_event(EVENT_PLAY, target_sample, midi);
+            self.voice_events[voice_idx].store(packed, Ordering::Relaxed);
+        }
+    }
+
+    /// Schedule a note-off (gate-off, ADSR enters Release) for `voice_idx`
+    /// at the given absolute audio sample.
+    pub fn schedule_note_off(&self, voice_idx: usize, target_sample: u64) {
+        if voice_idx < MAX_VOICES {
+            let packed = pack_voice_event(EVENT_RELEASE, target_sample, 0);
+            self.voice_events[voice_idx].store(packed, Ordering::Relaxed);
+        }
     }
 }
 
@@ -311,6 +356,9 @@ pub struct AudioEngine {
     adsr_packed: Arc<AtomicU64>,
     /// Per-drum scheduled trigger time (absolute audio sample), 0 = none.
     drum_schedule: Arc<[AtomicU64; NUM_DRUMS]>,
+    /// Per-voice scheduled events (packed: kind | midi | sample), 0 = none.
+    /// Used by the sequencer for sample-accurate note triggering.
+    voice_events: Arc<[AtomicU64; MAX_VOICES]>,
     /// Audio callback's current sample position. Used by the sequencer for
     /// sample-accurate scheduling.
     sample_clock: Arc<AtomicU64>,
@@ -356,6 +404,11 @@ impl AudioEngine {
             std::array::from_fn(|_| AtomicU64::new(0)),
         );
         let drum_schedule_clone = drum_schedule.clone();
+
+        let voice_events: Arc<[AtomicU64; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU64::new(0)),
+        );
+        let voice_events_clone = voice_events.clone();
 
         let sample_clock = Arc::new(AtomicU64::new(0));
         let sample_clock_clone = sample_clock.clone();
@@ -420,6 +473,33 @@ impl AudioEngine {
                             }
                         }
 
+                        // Sample-accurate voice (note) scheduling. Decoded
+                        // each frame; very cheap on x86 and never waits.
+                        for (i, slot) in voice_events_clone.iter().enumerate() {
+                            let packed = slot.load(Ordering::Relaxed);
+                            if packed == 0 {
+                                continue;
+                            }
+                            let (kind, target, midi) = unpack_voice_event(packed);
+                            if kind == EVENT_NONE || local_clock < target {
+                                continue;
+                            }
+                            match kind {
+                                EVENT_PLAY => {
+                                    voices[i].frequency = midi_to_freq(midi);
+                                    voices[i].phase = 0.0;
+                                    voices[i].active = true;
+                                    voices[i].envelope.gate_on();
+                                    active_clone[i].store(true, Ordering::Relaxed);
+                                }
+                                EVENT_RELEASE => {
+                                    voices[i].envelope.gate_off();
+                                }
+                                _ => {}
+                            }
+                            slot.store(0, Ordering::Relaxed);
+                        }
+
                         let mut mix = 0.0_f32;
 
                         for (i, voice) in voices.iter_mut().enumerate() {
@@ -466,15 +546,18 @@ impl AudioEngine {
             waveform,
             adsr_packed,
             drum_schedule,
+            voice_events,
             sample_clock,
             sample_rate,
         }
     }
 
-    /// Get a clonable, Send + Sync handle for sample-accurate drum scheduling.
-    pub fn drum_handle(&self) -> DrumHandle {
-        DrumHandle {
-            schedule: self.drum_schedule.clone(),
+    /// Get a clonable, Send + Sync handle for sample-accurate scheduling of
+    /// drums and pitched voices.
+    pub fn engine_handle(&self) -> EngineHandle {
+        EngineHandle {
+            drum_schedule: self.drum_schedule.clone(),
+            voice_events: self.voice_events.clone(),
             sample_clock: self.sample_clock.clone(),
             sample_rate: self.sample_rate,
         }

@@ -11,7 +11,7 @@ use crossterm::terminal;
 use envelope::AdsrParams;
 use keyboard::{spawn_keyboard_listener, KeyboardEvent};
 use notes::keyboard_help;
-use pattern::Pattern;
+use pattern::{Cell, Pattern, TrackKind};
 use sequencer::Sequencer;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -432,22 +432,32 @@ fn play_pattern(path: &str) {
     println!("  Steps: {}", pattern.steps);
     println!("  Tracks:");
     for t in &pattern.tracks {
-        let recognized = matches!(
-            t.name.to_ascii_lowercase().as_str(),
-            "kick" | "bd" | "bassdrum" | "snare" | "sd" | "hihat" | "hh" | "hat" | "closedhat"
-        );
-        let marker = if recognized { "♪" } else { "·" };
-        let visual: String = t.hits.iter().map(|h| if *h { 'x' } else { '-' }).collect();
-        println!("    {marker} {:<8} {}", t.name, visual);
+        match &t.kind {
+            TrackKind::Drum(hits) => {
+                let visual: String = hits.iter().map(|h| if *h { 'x' } else { '-' }).collect();
+                println!("    🥁 {:<8} {}", t.name, visual);
+            }
+            TrackKind::Notes(cells) => {
+                let visual: String = cells
+                    .iter()
+                    .map(|c| match c {
+                        Cell::Note(_) => 'N',
+                        Cell::Sustain => '.',
+                        Cell::Rest => '-',
+                    })
+                    .collect();
+                println!("    ♪  {:<8} {}", t.name, visual);
+            }
+        }
     }
     println!();
     println!("  Press Enter to stop.");
 
     let engine = AudioEngine::new();
-    let drum_handle = engine.drum_handle();
+    let engine_handle = engine.engine_handle();
 
     // Diagnostic: show timing math so we can spot any device-specific issue.
-    let sample_rate = drum_handle.sample_rate() as f64;
+    let sample_rate = engine_handle.sample_rate() as f64;
     let step_secs = 60.0 / pattern.bpm as f64 / 4.0;
     let samples_per_step = (step_secs * sample_rate).round() as u64;
     let bar_secs = step_secs * pattern.steps as f64;
@@ -457,7 +467,7 @@ fn play_pattern(path: &str) {
     );
     println!();
 
-    let mut seq = Sequencer::new(pattern, drum_handle);
+    let mut seq = Sequencer::new(pattern, engine_handle);
     seq.start();
 
     let mut buf = String::new();

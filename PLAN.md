@@ -60,26 +60,54 @@ prevent clipping), voice allocation (finding free slots via shared AtomicBool fl
 voice stealing (reusing the oldest voice when all are busy), the distinction between
 "no pending command" and "voice is free" in lock-free designs.
 
-### Phase 5: Step Sequencer & Rhythm 🚧
+### Phase 5: Step Sequencer, Patterns & Composition 🚧
 
-Build a step sequencer — a grid where each row is a sound and each column is a beat.
-Classic drum machine style (TR-808). This is the foundation for making actual music.
+Build a step sequencer — drums and pitched voices triggered on a grid — together
+with a text-based pattern file format that both humans and Claude can read/write.
+This is the foundation for making actual music.
 
+**Done so far:**
 - [x] Text-based pattern file format with parser (`src/pattern.rs`)
 - [x] Synthesized drum voices (kick / snare / hi-hat) inside the audio engine
 - [x] BPM / tempo clock with sample-accurate scheduling (`src/sequencer.rs`)
 - [x] CLI pattern player: `cargo run -- --play <file.pat>`
-- [ ] Visual grid in the TUI — see the playhead move across beats
-- [ ] Play/pause/stop controls in the TUI
-- [ ] Edit / save patterns interactively in the TUI
+- [x] Melodic note tracks: scientific pitch notation (`C4`, `Eb3`, `F#5`),
+      sustain (`.`) and rest (`-`) cells, up to 8 simultaneous note tracks
+      sharing the pitched voice pool
 
-**Concepts learned so far**: tempo and BPM, beats and bars, 16th-note subdivisions in
-4/4, drum kit anatomy (kick on the downbeat, snare on the backbeat, hi-hat driving
-8ths), four-on-the-floor as the canonical dance rhythm, drum synthesis from primitives
-(pitch-swept sine for kick, noise + body tone for snare), why hard time-cutoffs cause
-clicks (discontinuity at non-zero amplitude), and sample-accurate scheduling vs.
-wall-clock scheduling — the latter suffers from audio buffer jitter that the ear can
-hear as one beat being "off".
+**Next slices (in build order):**
+- [ ] **Slice 5a — Per-track instruments**: each track can declare its own
+      waveform (`wave: square`), so bass and lead can have different timbres.
+      Requires adding per-voice waveform state to the audio engine (currently
+      a single global `AtomicU8`).
+- [ ] **Slice 5b — Chord shorthand**: tokens like `Cm`, `G7`, `Dmaj`, `Fsus4`
+      expand to multi-note stacks that play simultaneously. Lets Claude compose
+      from chord sheets directly. Format: a `chord` track type that grabs
+      multiple voices.
+- [ ] **Slice 5c — Longer patterns / song chaining**: escape the 1-bar loop.
+      Either allow `steps: 64` for multi-bar patterns, or define multiple
+      `[pattern_name]` blocks plus a `song:` chain that names them in order
+      (intro → verse → chorus → verse → outro).
+- [ ] **Slice 5d — Visual grid in the TUI**: third UI mode (after piano/ADSR)
+      that shows the pattern grid with a moving playhead.
+- [ ] **Slice 5e — TUI editing**: toggle steps with arrow keys + space, save
+      back to `.pat` files. Live-reload while playing.
+- [ ] Export a played pattern to WAV (offline render).
+
+**Concepts learned so far**: tempo and BPM, beats and bars, 16th-note subdivisions
+in 4/4, drum kit anatomy (kick on the downbeat, snare on the backbeat, hi-hat
+driving 8ths), four-on-the-floor as the canonical dance rhythm, drum synthesis
+from primitives (pitch-swept sine for kick, noise + body tone for snare), why
+hard time-cutoffs cause clicks (discontinuity at non-zero amplitude), and
+sample-accurate scheduling vs. wall-clock scheduling — the latter suffers from
+audio buffer jitter that the ear can hear as one beat being "off". Scientific
+pitch notation (middle C = C4 = MIDI 60), packed atomic event encoding for
+lock-free voice scheduling, and the C minor pentatonic / Eb major scale flavor
+that drives melodic indie/chiptune music.
+
+**Concepts to learn next**: subtractive timbres (sine vs square vs saw character),
+chord construction (triads, 7ths, sus chords), inversions, voicing, song form
+(intro / verse / chorus / bridge), and the difference between a riff and a song.
 
 ### Phase 6: Sampling & Drum Kits
 
@@ -95,45 +123,50 @@ the sequencer to make drum patterns with real sounds.
 drum kit anatomy (kick grounds the beat, snare marks the backbeat, hi-hat drives
 rhythm), layering sounds.
 
-### Phase 7: Melody, Chords & Composition
+### Phase 7: Live Performance & Recording
 
-Layer melodic and harmonic patterns over drums. Chain patterns into songs.
-Support text-based composition so both humans and Claude can write music.
+Now that the engine can play composed music, add the tools to capture it and
+play along live.
 
-- [ ] Melodic tracks using note names (C4, Eb3, F#5)
-- [ ] Chord shorthand that expands to notes (Cm, G7, Dmaj)
-- [ ] Multiple pattern tracks — drums + bass + lead
-- [ ] Pattern chaining — arrange patterns into a song (intro → verse → chorus)
-- [ ] Quantization — snap live-played notes to the grid
-- [ ] Export full compositions to WAV
+- [ ] Quantization — snap live-played piano notes to the sequencer grid
+- [ ] Live recording — play into the sequencer in real time and have it
+      written to a pattern file
+- [ ] MIDI input support (connect a real MIDI keyboard)
+- [ ] Tap-tempo and metronome
+- [ ] Export full compositions to WAV (offline render the whole song)
 
-**Concepts to learn**: scales and keys (major/minor), intervals, chord construction
-(triads, 7ths), chord progressions (I-IV-V-I, ii-V-I, 12-bar blues), song structure
-(verse, chorus, bridge), the role of bass vs lead, call-and-response.
+**Concepts to learn**: quantization tradeoffs (loose vs strict), MIDI protocol
+basics, click tracks, the relationship between recording and performance.
 
-### Pattern File Format
+### Pattern File Format (current)
 
-Human-readable text files that both the TUI and Claude can read/write:
+Human-readable text files that both the TUI and Claude can read/write. The
+format supports drum tracks (single-char cells: `x` = hit, `-`/`.` = rest)
+and note tracks (whitespace-separated tokens: note names like `C4`, `Eb3`,
+`F#5`, plus `-` rest and `.` sustain).
 
 ```
-bpm: 120
-time: 4/4
-key: C minor
+# C minor groove with drums and a walking bass + lead riff.
+bpm: 110
+steps: 16
 
-[drums]
 kick:    x---x---x---x---
 snare:   ----x-------x---
 hihat:   x-x-x-x-x-x-x-x-
 
-[bass]
-notes:   C2--G2--Ab2-Eb2-
-
-[lead]
-notes:   .---Eb4G4Ab4-G4--
+bass:    C2  .  .  .  Eb2 .  .  .  G2  .  .  .  F2  .  .  .
+lead:    Eb4 F4 G4 Bb4 C5  .  Bb4 G4 F4  .  Eb4 .  D4  .  C4  .
 ```
 
-This enables Claude to generate patterns from chord sheets, lead sheets, or
-descriptions like "write me a 12-bar blues in E".
+The parser auto-detects per row whether it's a drum or note track. Track
+names map to drum kinds (`kick`/`bd`, `snare`/`sd`, `hihat`/`hh`/`hat`) or
+become melodic note tracks. Note tracks consume voices in declaration order
+from the shared 8-voice pitched pool. Comments with `#` only at the start
+of a line (so `F#4` parses as F-sharp 4, not "F" followed by a comment).
+
+Coming soon (slices 5a-5c): per-track `wave:` declarations, `chord` track
+type with shorthand like `Cm`, `G7`, `Dmaj`, and either `steps: 64` or a
+`song:` chain across multiple `[pattern_name]` blocks.
 
 ### Phase 8: Filters & Effects
 
