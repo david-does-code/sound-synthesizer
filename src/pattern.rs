@@ -82,12 +82,37 @@ use std::path::Path;
 /// Default octave for chord roots when no `track.octave: N` property is set.
 const DEFAULT_CHORD_OCTAVE: i32 = 3;
 
-/// A parsed pattern: tempo, length, and a set of tracks.
+/// A parsed pattern file: tempo, one or more named sections, and a song chain
+/// that says which order to play them in. A file with no `[section]` headers
+/// is parsed into a single section called `"main"` with an implicit song
+/// `[main x1]`, so existing single-pattern files keep working.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub bpm: u32,
+    pub sections: Vec<Section>,
+    pub song: Vec<SongEntry>,
+}
+
+/// A named section of music — equivalent to "one pattern" in the old format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Section {
+    pub name: String,
     pub steps: usize,
     pub tracks: Vec<Track>,
+}
+
+/// One entry in a song chain: which section to play and how many times in a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SongEntry {
+    pub section: String,
+    pub repeat: u32,
+}
+
+impl Pattern {
+    /// Look up a section by name.
+    pub fn section(&self, name: &str) -> Option<&Section> {
+        self.sections.iter().find(|s| s.name == name)
+    }
 }
 
 /// A single track within a pattern.
@@ -171,6 +196,15 @@ pub enum PatternParseError {
         prop: String,
         value: String,
     },
+    /// `[section]` header was malformed — e.g. missing closing bracket.
+    MalformedSectionHeader { line: usize, content: String },
+    /// A `song:` entry referenced a section that doesn't exist.
+    UnknownSection { line: usize, name: String },
+    /// A `song:` repeat count couldn't be parsed (e.g. `verse xfoo`).
+    InvalidSongRepeat { line: usize, token: String },
+    /// A track row appeared before any section header in a multi-section file
+    /// (only allowed in single-section files where the section is implicit).
+    OrphanTrackRow { line: usize, track: String },
     Io(String),
 }
 
@@ -205,6 +239,22 @@ impl fmt::Display for PatternParseError {
                 f,
                 "line {line}: invalid value {value:?} for {track:?}.{prop} property"
             ),
+            Self::MalformedSectionHeader { line, content } => write!(
+                f,
+                "line {line}: malformed section header {content:?} (expected `[name]`)"
+            ),
+            Self::UnknownSection { line, name } => write!(
+                f,
+                "line {line}: song references unknown section {name:?}"
+            ),
+            Self::InvalidSongRepeat { line, token } => write!(
+                f,
+                "line {line}: invalid song repeat {token:?} (expected like `x4`)"
+            ),
+            Self::OrphanTrackRow { line, track } => write!(
+                f,
+                "line {line}: track {track:?} appears outside any section header"
+            ),
             Self::Io(e) => write!(f, "i/o error: {e}"),
         }
     }
@@ -223,14 +273,16 @@ impl Pattern {
     ///
     /// Two passes: the first collects per-track properties (so they can be
     /// declared either before or after the track row), the second builds the
-    /// header values and the tracks themselves.
+    /// header values, sections, and song chain.
     pub fn parse(text: &str) -> Result<Self, PatternParseError> {
         // ── pass 1: collect per-track properties ───────────────────────────
+        // Properties are global across all sections, so they can appear
+        // anywhere in the file.
         let mut props: HashMap<String, TrackProps> = HashMap::new();
         for (idx, raw_line) in text.lines().enumerate() {
             let line_no = idx + 1;
             let line = strip_comment(raw_line).trim();
-            if line.is_empty() {
+            if line.is_empty() || is_section_header(line) {
                 continue;
             }
             let Some((key, value)) = line.split_once(':') else {
@@ -244,16 +296,46 @@ impl Pattern {
             }
         }
 
-        // ── pass 2: parse headers and tracks ───────────────────────────────
+        // ── pass 2: parse headers, sections, and the song chain ────────────
         let mut bpm: Option<u32> = None;
-        let mut steps: Option<usize> = None;
-        let mut tracks: Vec<Track> = Vec::new();
+        let mut global_steps: Option<usize> = None;
+        let mut sections: Vec<Section> = Vec::new();
+        let mut song: Vec<SongEntry> = Vec::new();
+
+        // The "current section" tracks where new track rows go. It starts as
+        // an implicit anonymous section so that single-pattern files (no
+        // `[section]` headers) keep working unchanged.
+        let mut current: Option<Section> = None;
+        let mut implicit_section = true;
 
         for (idx, raw_line) in text.lines().enumerate() {
             let line_no = idx + 1;
             let line = strip_comment(raw_line).trim();
             if line.is_empty() {
                 continue;
+            }
+
+            // ── section header: `[name]` ───────────────────────────────────
+            if let Some(name) = parse_section_header(line) {
+                // Flush the current section if there is one.
+                if let Some(sec) = current.take() {
+                    sections.push(sec);
+                }
+                current = Some(Section {
+                    name: name.to_string(),
+                    steps: global_steps.unwrap_or(0),
+                    tracks: Vec::new(),
+                });
+                implicit_section = false;
+                continue;
+            }
+
+            // Reject obvious half-headers that didn't match parse_section_header.
+            if line.starts_with('[') {
+                return Err(PatternParseError::MalformedSectionHeader {
+                    line: line_no,
+                    content: line.to_string(),
+                });
             }
 
             let (key, value) = match line.split_once(':') {
@@ -276,11 +358,38 @@ impl Pattern {
                     bpm = Some(parse_header_num(line_no, key, value)?);
                 }
                 "steps" => {
-                    steps = Some(parse_header_num(line_no, key, value)?);
+                    let n: usize = parse_header_num(line_no, key, value)?;
+                    if let Some(ref mut sec) = current {
+                        // Per-section steps. If we're still in the implicit
+                        // section, also remember it as the global default.
+                        sec.steps = n;
+                    }
+                    if implicit_section || global_steps.is_none() {
+                        global_steps = Some(n);
+                    }
+                }
+                "song" => {
+                    song = parse_song_chain(line_no, value)?;
                 }
                 _ => {
-                    let expected =
-                        steps.ok_or(PatternParseError::MissingHeader("steps"))?;
+                    // It's a track row. Make sure we have a section to put it in.
+                    if current.is_none() && implicit_section {
+                        current = Some(Section {
+                            name: "main".to_string(),
+                            steps: global_steps.unwrap_or(0),
+                            tracks: Vec::new(),
+                        });
+                    }
+                    let sec = current.as_mut().ok_or_else(|| {
+                        PatternParseError::OrphanTrackRow {
+                            line: line_no,
+                            track: key.to_string(),
+                        }
+                    })?;
+                    if sec.steps == 0 {
+                        return Err(PatternParseError::MissingHeader("steps"));
+                    }
+                    let expected = sec.steps;
                     let track_props = props.get(key).cloned().unwrap_or_default();
                     let kind = if looks_like_drum_track(value) {
                         TrackKind::Drum(parse_drum_row(line_no, value, expected)?)
@@ -290,7 +399,7 @@ impl Pattern {
                     } else {
                         TrackKind::Notes(parse_note_row(line_no, value, expected)?)
                     };
-                    tracks.push(Track {
+                    sec.tracks.push(Track {
                         name: key.to_string(),
                         kind,
                         wave: track_props.wave,
@@ -299,12 +408,83 @@ impl Pattern {
             }
         }
 
+        // Flush the final section.
+        if let Some(sec) = current.take() {
+            sections.push(sec);
+        }
+
+        // Default song chain: every section in declaration order, played once each.
+        // For single-section files this just plays the only section forever.
+        if song.is_empty() {
+            song = sections
+                .iter()
+                .map(|s| SongEntry {
+                    section: s.name.clone(),
+                    repeat: 1,
+                })
+                .collect();
+        }
+
+        // Validate that every song entry references a real section.
+        for entry in &song {
+            if !sections.iter().any(|s| s.name == entry.section) {
+                return Err(PatternParseError::UnknownSection {
+                    line: 0,
+                    name: entry.section.clone(),
+                });
+            }
+        }
+
         Ok(Pattern {
             bpm: bpm.ok_or(PatternParseError::MissingHeader("bpm"))?,
-            steps: steps.ok_or(PatternParseError::MissingHeader("steps"))?,
-            tracks,
+            sections,
+            song,
         })
     }
+}
+
+fn is_section_header(line: &str) -> bool {
+    line.starts_with('[') && line.ends_with(']') && line.len() >= 3
+}
+
+/// Parse a `[name]` line into the section name. Returns `None` if not a section header.
+fn parse_section_header(line: &str) -> Option<&str> {
+    if is_section_header(line) {
+        Some(line[1..line.len() - 1].trim())
+    } else {
+        None
+    }
+}
+
+/// Parse a song chain line like `intro verse x2 chorus outro` into a list of
+/// (section, repeat) entries.
+fn parse_song_chain(line_no: usize, value: &str) -> Result<Vec<SongEntry>, PatternParseError> {
+    let mut entries: Vec<SongEntry> = Vec::new();
+    for token in value.split_whitespace() {
+        if let Some(rest) = token.strip_prefix('x') {
+            // Repeat marker — applies to the previous entry.
+            let n: u32 = rest
+                .parse()
+                .map_err(|_| PatternParseError::InvalidSongRepeat {
+                    line: line_no,
+                    token: token.to_string(),
+                })?;
+            if let Some(last) = entries.last_mut() {
+                last.repeat = n;
+            } else {
+                return Err(PatternParseError::InvalidSongRepeat {
+                    line: line_no,
+                    token: token.to_string(),
+                });
+            }
+        } else {
+            entries.push(SongEntry {
+                section: token.to_string(),
+                repeat: 1,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 /// Per-track properties accumulated in pass 1 of parsing.
@@ -672,11 +852,11 @@ hihat:   x-x-x-x-x-x-x-x-
 ";
         let pat = Pattern::parse(text).expect("should parse");
         assert_eq!(pat.bpm, 120);
-        assert_eq!(pat.steps, 16);
-        assert_eq!(pat.tracks.len(), 3);
+        assert_eq!(pat.sections[0].steps, 16);
+        assert_eq!(pat.sections[0].tracks.len(), 3);
 
-        assert_eq!(pat.tracks[0].name, "kick");
-        let kick = drum_hits(&pat.tracks[0]);
+        assert_eq!(pat.sections[0].tracks[0].name, "kick");
+        let kick = drum_hits(&pat.sections[0].tracks[0]);
         assert_eq!(
             kick,
             &vec![
@@ -685,11 +865,11 @@ hihat:   x-x-x-x-x-x-x-x-
             ]
         );
 
-        let snare = drum_hits(&pat.tracks[1]);
+        let snare = drum_hits(&pat.sections[0].tracks[1]);
         assert!(snare[4]);
         assert!(snare[12]);
 
-        let hihat = drum_hits(&pat.tracks[2]);
+        let hihat = drum_hits(&pat.sections[0].tracks[2]);
         assert_eq!(hihat.iter().filter(|h| **h).count(), 8);
     }
 
@@ -701,7 +881,7 @@ steps: 8
 bass: C2 . . . Eb2 . . .
 ";
         let pat = Pattern::parse(text).unwrap();
-        let cells = notes(&pat.tracks[0]);
+        let cells = notes(&pat.sections[0].tracks[0]);
         assert_eq!(cells.len(), 8);
         assert_eq!(cells[0], Cell::Note(36)); // C2
         assert_eq!(cells[1], Cell::Sustain);
@@ -719,7 +899,7 @@ steps: 8
 lead: C4 D4 Eb4 F#4 - . G4 -
 ";
         let pat = Pattern::parse(text).unwrap();
-        let cells = notes(&pat.tracks[0]);
+        let cells = notes(&pat.sections[0].tracks[0]);
         assert_eq!(cells[0], Cell::Note(60));
         assert_eq!(cells[1], Cell::Note(62));
         assert_eq!(cells[2], Cell::Note(63));
@@ -739,8 +919,8 @@ kick: x-x-
 bass: C2 . G2 .
 ";
         let pat = Pattern::parse(text).unwrap();
-        assert!(matches!(pat.tracks[0].kind, TrackKind::Drum(_)));
-        assert!(matches!(pat.tracks[1].kind, TrackKind::Notes(_)));
+        assert!(matches!(pat.sections[0].tracks[0].kind, TrackKind::Drum(_)));
+        assert!(matches!(pat.sections[0].tracks[1].kind, TrackKind::Notes(_)));
     }
 
     #[test]
@@ -756,8 +936,8 @@ kick: x-x-x-x-
 ";
         let pat = Pattern::parse(text).unwrap();
         assert_eq!(pat.bpm, 90);
-        assert_eq!(pat.steps, 8);
-        let kick = drum_hits(&pat.tracks[0]);
+        assert_eq!(pat.sections[0].steps, 8);
+        let kick = drum_hits(&pat.sections[0].tracks[0]);
         assert_eq!(kick.len(), 8);
     }
 
@@ -769,7 +949,7 @@ steps: 4
 lead: C#4 D#4 F#4 G#4
 ";
         let pat = Pattern::parse(text).unwrap();
-        let cells = notes(&pat.tracks[0]);
+        let cells = notes(&pat.sections[0].tracks[0]);
         assert_eq!(cells, &vec![
             Cell::Note(61),
             Cell::Note(63),
@@ -787,7 +967,7 @@ hat: x - x - x - x -
 ";
         let pat = Pattern::parse(text).unwrap();
         assert_eq!(
-            drum_hits(&pat.tracks[0]),
+            drum_hits(&pat.sections[0].tracks[0]),
             &vec![true, false, true, false, true, false, true, false]
         );
     }
@@ -898,7 +1078,7 @@ bass.wave: square
 bass: C2 . . .
 ";
         let pat = Pattern::parse(text).unwrap();
-        assert_eq!(pat.tracks[0].wave, Some(Waveform::Square));
+        assert_eq!(pat.sections[0].tracks[0].wave, Some(Waveform::Square));
     }
 
     #[test]
@@ -910,7 +1090,7 @@ bass: C2 . . .
 bass.wave: triangle
 ";
         let pat = Pattern::parse(text).unwrap();
-        assert_eq!(pat.tracks[0].wave, Some(Waveform::Triangle));
+        assert_eq!(pat.sections[0].tracks[0].wave, Some(Waveform::Triangle));
     }
 
     #[test]
@@ -1008,7 +1188,7 @@ steps: 8
 pad: Cm . . . Fm . . .
 ";
         let pat = Pattern::parse(text).unwrap();
-        let cells = chords(&pat.tracks[0]);
+        let cells = chords(&pat.sections[0].tracks[0]);
         assert_eq!(cells.len(), 8);
         assert_eq!(cells[0], ChordCell::Chord(vec![48, 51, 55])); // Cm in oct 3
         assert_eq!(cells[1], ChordCell::Sustain);
@@ -1024,7 +1204,7 @@ pad.octave: 4
 pad: Cm . . .
 ";
         let pat = Pattern::parse(text).unwrap();
-        let cells = chords(&pat.tracks[0]);
+        let cells = chords(&pat.sections[0].tracks[0]);
         assert_eq!(cells[0], ChordCell::Chord(vec![60, 63, 67])); // Cm in oct 4
     }
 
@@ -1039,7 +1219,7 @@ pad: Cm . . .
 pad.octave: 5
 ";
         let pat = Pattern::parse(text).unwrap();
-        let cells = chords(&pat.tracks[0]);
+        let cells = chords(&pat.sections[0].tracks[0]);
         assert_eq!(cells[0], ChordCell::Chord(vec![72, 75, 79])); // Cm in oct 5
     }
 
@@ -1052,7 +1232,7 @@ steps: 4
 prog: Cm Fm G7 Cm
 ";
         let pat = Pattern::parse(text).unwrap();
-        assert!(matches!(pat.tracks[0].kind, TrackKind::Chord(_)));
+        assert!(matches!(pat.sections[0].tracks[0].kind, TrackKind::Chord(_)));
     }
 
     #[test]
@@ -1064,8 +1244,166 @@ steps: 4
 melody: C4 D4 C7 E4
 ";
         let pat = Pattern::parse(text).unwrap();
-        let cells = notes(&pat.tracks[0]);
+        let cells = notes(&pat.sections[0].tracks[0]);
         assert_eq!(cells[0], Cell::Note(60));
         assert_eq!(cells[2], Cell::Note(96)); // C in octave 7, NOT C dom7
+    }
+
+    // ── slice 5c: sections + song chain ────────────────────────────────────
+
+    #[test]
+    fn single_pattern_files_become_one_main_section() {
+        let text = "\
+bpm: 120
+steps: 4
+kick: x---
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(pat.sections.len(), 1);
+        assert_eq!(pat.sections[0].name, "main");
+        assert_eq!(pat.sections[0].steps, 4);
+        assert_eq!(pat.song, vec![SongEntry { section: "main".into(), repeat: 1 }]);
+    }
+
+    #[test]
+    fn parses_multiple_named_sections() {
+        let text = "\
+bpm: 120
+steps: 4
+
+[verse]
+kick: x---
+
+[chorus]
+kick: x-x-
+snare: ----
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(pat.sections.len(), 2);
+        assert_eq!(pat.sections[0].name, "verse");
+        assert_eq!(pat.sections[0].tracks.len(), 1);
+        assert_eq!(pat.sections[1].name, "chorus");
+        assert_eq!(pat.sections[1].tracks.len(), 2);
+    }
+
+    #[test]
+    fn default_song_chain_plays_each_section_once() {
+        let text = "\
+bpm: 120
+steps: 4
+[a]
+kick: x---
+[b]
+kick: -x--
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(
+            pat.song,
+            vec![
+                SongEntry { section: "a".into(), repeat: 1 },
+                SongEntry { section: "b".into(), repeat: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_song_chain_with_repeats() {
+        let text = "\
+bpm: 120
+steps: 4
+song: intro verse x4 chorus verse x2 outro
+
+[intro]
+kick: x---
+[verse]
+kick: x-x-
+[chorus]
+kick: xx-x
+[outro]
+kick: x---
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(
+            pat.song,
+            vec![
+                SongEntry { section: "intro".into(), repeat: 1 },
+                SongEntry { section: "verse".into(), repeat: 4 },
+                SongEntry { section: "chorus".into(), repeat: 1 },
+                SongEntry { section: "verse".into(), repeat: 2 },
+                SongEntry { section: "outro".into(), repeat: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn per_section_steps_overrides_global() {
+        // `steps: 8` is the global default. `[short]` overrides it to 4;
+        // `[normal]` has no override and inherits the global 8.
+        let text = "\
+bpm: 120
+steps: 8
+[short]
+steps: 4
+kick: x---
+[normal]
+kick: x-x-x-x-
+[long]
+steps: 16
+kick: x-------x-------
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(pat.section("short").unwrap().steps, 4);
+        assert_eq!(pat.section("normal").unwrap().steps, 8);
+        assert_eq!(pat.section("long").unwrap().steps, 16);
+    }
+
+    #[test]
+    fn errors_on_song_referencing_unknown_section() {
+        let text = "\
+bpm: 120
+steps: 4
+song: intro mystery_section
+
+[intro]
+kick: x---
+";
+        match Pattern::parse(text).unwrap_err() {
+            PatternParseError::UnknownSection { name, .. } => assert_eq!(name, "mystery_section"),
+            other => panic!("expected UnknownSection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn errors_on_invalid_song_repeat() {
+        let text = "\
+bpm: 120
+steps: 4
+song: verse xfoo
+[verse]
+kick: x---
+";
+        match Pattern::parse(text).unwrap_err() {
+            PatternParseError::InvalidSongRepeat { token, .. } => assert_eq!(token, "xfoo"),
+            other => panic!("expected InvalidSongRepeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn properties_are_global_across_sections() {
+        // `bass.wave: square` should apply to bass tracks in any section.
+        let text = "\
+bpm: 120
+steps: 4
+bass.wave: square
+
+[verse]
+bass: C2 . . .
+
+[chorus]
+bass: G2 . . .
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(pat.sections[0].tracks[0].wave, Some(Waveform::Square));
+        assert_eq!(pat.sections[1].tracks[0].wave, Some(Waveform::Square));
     }
 }

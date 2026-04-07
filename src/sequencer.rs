@@ -8,27 +8,31 @@
 //! | `snare`, `sd`         | [`Drum::Snare`]    |
 //! | `hihat`, `hh`, `hat`  | [`Drum::HiHat`]    |
 //!
-//! Note tracks are assigned a pitched voice each, in the order they appear in
-//! the pattern. With 8 pitched voices total, up to 8 simultaneous note tracks
-//! are supported. Extra note tracks are silently dropped (TODO: warn).
+//! Note tracks consume one voice each from the 8-voice pitched pool. Chord
+//! tracks consume a contiguous block of N voices, where N is the largest
+//! chord size in that track. **Voice assignments are global across all
+//! sections in a song**: the first appearance of a track name (in song order)
+//! gets a voice slot, and every later section that uses the same track name
+//! reuses the same slot. This means a `bass` line that appears in both verse
+//! and chorus shares one voice — its envelope state can carry over cleanly.
+//!
+//! ## Song playback
+//!
+//! The sequencer walks the [`Pattern::song`] chain, playing each section the
+//! requested number of times in order, then loops the whole song forever.
+//! When transitioning from one section to a different one, voices that were
+//! used by the previous section but not the new one are released, so notes
+//! don't drone forever after their track disappears.
 //!
 //! ## Timing
 //!
-//! Naive `thread::sleep` per step suffers from audio buffer jitter — a "trigger
-//! now" flag waits for the next callback boundary, introducing several
-//! milliseconds of random offset per hit.
-//!
-//! Instead, the sequencer thread uses **sample-accurate scheduling**: it
-//! pre-computes the absolute audio sample for each step and writes it to the
-//! [`EngineHandle`]. The audio callback fires the drum or voice on the exact
-//! sample, independent of when the sequencer thread woke up.
-//!
-//! A ~100 ms lookahead ensures events are queued well before the audio callback
-//! would have processed them. Sleep timing only affects when scheduling happens,
-//! never when playback happens.
+//! See the slice 2 commit for the lock-free, sample-accurate scheduling
+//! design. The same scheme is used here — the only thing that changed is
+//! that `tick` now counts steps across the entire song, not just one bar.
 
 use crate::audio::{Drum, EngineHandle, MAX_VOICES};
 use crate::pattern::{Cell, ChordCell, Pattern, TrackKind};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -41,8 +45,8 @@ pub struct Sequencer {
     handle: Option<JoinHandle<()>>,
 }
 
-/// A track resolved into something the sequencer thread can dispatch directly,
-/// without re-walking the original [`Pattern`] structure on every tick.
+/// One pitched / chord track resolved into something the sequencer thread can
+/// dispatch directly, without re-walking the pattern.
 enum ResolvedTrack {
     Drum {
         drum: Drum,
@@ -52,14 +56,29 @@ enum ResolvedTrack {
         voice_idx: usize,
         cells: Vec<Cell>,
     },
-    /// A chord track owns N consecutive voices starting at `voice_base`.
-    /// `slots` is N — the number of simultaneous notes the track can play
-    /// (the largest chord encountered).
+    /// Chord tracks own `slots` consecutive voices starting at `voice_base`.
     Chord {
         voice_base: usize,
         slots: usize,
         cells: Vec<ChordCell>,
     },
+}
+
+/// One section resolved against the global voice assignment.
+struct ResolvedSection {
+    name: String,
+    steps: usize,
+    tracks: Vec<ResolvedTrack>,
+    /// Distinct pitched-voice indices used by this section's note/chord tracks.
+    /// Used at section transitions to release voices that drop out.
+    voice_set: Vec<usize>,
+}
+
+/// A voice allocation for one melodic/chord track name.
+#[derive(Clone, Copy)]
+struct VoiceAlloc {
+    base: usize,
+    slots: usize,
 }
 
 impl Sequencer {
@@ -83,78 +102,9 @@ impl Sequencer {
         let step_secs = 60.0 / pattern.bpm as f64 / 4.0;
         let samples_per_step = (step_secs * sample_rate).round() as u64;
 
-        // Resolve every track once, up-front. Note tracks consume voice indices
-        // 0..n in the order they appear; chord tracks consume a contiguous block
-        // of voices equal to their max chord size. Tracks that don't fit in
-        // MAX_VOICES are dropped with a warning.
-        let mut resolved: Vec<ResolvedTrack> = Vec::with_capacity(pattern.tracks.len());
-        let mut next_voice: usize = 0;
-        for track in &pattern.tracks {
-            match &track.kind {
-                TrackKind::Drum(hits) => {
-                    if let Some(drum) = resolve_drum(&track.name) {
-                        resolved.push(ResolvedTrack::Drum {
-                            drum,
-                            hits: hits.clone(),
-                        });
-                    }
-                }
-                TrackKind::Notes(cells) => {
-                    if next_voice >= MAX_VOICES {
-                        eprintln!(
-                            "warning: note track {:?} dropped — only {} pitched voices available",
-                            track.name, MAX_VOICES
-                        );
-                        continue;
-                    }
-                    if let Some(wave) = track.wave {
-                        engine.set_voice_waveform(next_voice, wave);
-                    }
-                    resolved.push(ResolvedTrack::Notes {
-                        voice_idx: next_voice,
-                        cells: cells.clone(),
-                    });
-                    next_voice += 1;
-                }
-                TrackKind::Chord(cells) => {
-                    let max_chord = cells
-                        .iter()
-                        .filter_map(|c| match c {
-                            ChordCell::Chord(notes) => Some(notes.len()),
-                            _ => None,
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    if max_chord == 0 {
-                        // Track has no actual chords — skip it.
-                        continue;
-                    }
-                    if next_voice + max_chord > MAX_VOICES {
-                        eprintln!(
-                            "warning: chord track {:?} dropped — needs {} voices but only {} remain",
-                            track.name,
-                            max_chord,
-                            MAX_VOICES - next_voice
-                        );
-                        continue;
-                    }
-                    let voice_base = next_voice;
-                    if let Some(wave) = track.wave {
-                        for v in voice_base..(voice_base + max_chord) {
-                            engine.set_voice_waveform(v, wave);
-                        }
-                    }
-                    resolved.push(ResolvedTrack::Chord {
-                        voice_base,
-                        slots: max_chord,
-                        cells: cells.clone(),
-                    });
-                    next_voice += max_chord;
-                }
-            }
-        }
-
-        let total_steps = pattern.steps;
+        // Pre-resolve voice allocations and per-section dispatch tables.
+        let resolved_sections = pre_resolve(&pattern, &engine);
+        let song = pattern.song.clone();
 
         let handle = thread::spawn(move || {
             // Lookahead: schedule events ~100 ms in the future so they're
@@ -164,84 +114,64 @@ impl Sequencer {
             let start_sample = engine.current_sample() + lookahead_samples;
 
             let scheduling_start = Instant::now();
-            let mut step: usize = 0;
             let mut tick: u64 = 0;
+            let mut prev_voice_set: Vec<usize> = Vec::new();
 
-            while !stop.load(Ordering::Relaxed) {
-                let target_sample = start_sample + tick * samples_per_step;
+            'outer: loop {
+                for entry in &song {
+                    let Some(section) =
+                        resolved_sections.iter().find(|s| s.name == entry.section)
+                    else {
+                        // Should never happen — parser already validated.
+                        continue;
+                    };
 
-                // Dispatch every track's event for this step.
-                for track in &resolved {
-                    match track {
-                        ResolvedTrack::Drum { drum, hits } => {
-                            if hits[step] {
-                                engine.schedule_at(*drum, target_sample);
+                    for _ in 0..entry.repeat {
+                        if stop.load(Ordering::Relaxed) {
+                            break 'outer;
+                        }
+
+                        // Section transition: release any voices used by the
+                        // previous section that this one doesn't touch, so a
+                        // sustained bass note from the verse doesn't drone
+                        // through a kick-only outro.
+                        let transition_sample = start_sample + tick * samples_per_step;
+                        for v in &prev_voice_set {
+                            if !section.voice_set.contains(v) {
+                                engine.schedule_note_off(*v, transition_sample);
                             }
                         }
-                        ResolvedTrack::Notes { voice_idx, cells } => match cells[step] {
-                            Cell::Note(midi) => {
-                                engine.schedule_note_on(*voice_idx, target_sample, midi);
+
+                        for step in 0..section.steps {
+                            if stop.load(Ordering::Relaxed) {
+                                break 'outer;
                             }
-                            Cell::Rest => {
-                                engine.schedule_note_off(*voice_idx, target_sample);
+
+                            let target_sample = start_sample + tick * samples_per_step;
+
+                            for track in &section.tracks {
+                                dispatch_step(&engine, track, step, target_sample);
                             }
-                            Cell::Sustain => {
-                                // Nothing to do — voice keeps playing.
+
+                            tick += 1;
+                            let next_wakeup = scheduling_start
+                                + Duration::from_secs_f64(step_secs * tick as f64);
+                            let now = Instant::now();
+                            if next_wakeup > now {
+                                thread::sleep(next_wakeup - now);
                             }
-                        },
-                        ResolvedTrack::Chord { voice_base, slots, cells } => match &cells[step] {
-                            ChordCell::Chord(notes) => {
-                                // Trigger one note per voice slot. Any extra
-                                // slots beyond this chord's note count get
-                                // released so previous notes don't linger.
-                                for s in 0..*slots {
-                                    let voice = voice_base + s;
-                                    if let Some(midi) = notes.get(s) {
-                                        engine.schedule_note_on(voice, target_sample, *midi);
-                                    } else {
-                                        engine.schedule_note_off(voice, target_sample);
-                                    }
-                                }
-                            }
-                            ChordCell::Rest => {
-                                for s in 0..*slots {
-                                    engine.schedule_note_off(voice_base + s, target_sample);
-                                }
-                            }
-                            ChordCell::Sustain => {
-                                // Voices keep playing.
-                            }
-                        },
+                        }
+
+                        prev_voice_set = section.voice_set.clone();
                     }
                 }
-
-                // Sleep until ~when the next step needs scheduling. Wakeup time
-                // is wall-clock based; playback time is sample-accurate.
-                tick += 1;
-                let next_wakeup = scheduling_start
-                    + Duration::from_secs_f64(step_secs * tick as f64);
-                let now = Instant::now();
-                if next_wakeup > now {
-                    thread::sleep(next_wakeup - now);
-                }
-
-                step = (step + 1) % total_steps;
             }
 
-            // On stop, release any voices we own so they fade out cleanly.
+            // On stop, release every pitched voice we touched so the song
+            // fades out cleanly instead of cutting off mid-note.
             let release_at = engine.current_sample() + 1;
-            for track in &resolved {
-                match track {
-                    ResolvedTrack::Notes { voice_idx, .. } => {
-                        engine.schedule_note_off(*voice_idx, release_at);
-                    }
-                    ResolvedTrack::Chord { voice_base, slots, .. } => {
-                        for s in 0..*slots {
-                            engine.schedule_note_off(voice_base + s, release_at);
-                        }
-                    }
-                    ResolvedTrack::Drum { .. } => {}
-                }
+            for v in &prev_voice_set {
+                engine.schedule_note_off(*v, release_at);
             }
         });
         self.handle = Some(handle);
@@ -259,6 +189,191 @@ impl Sequencer {
 impl Drop for Sequencer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Walk every section in declaration order and allocate pitched voices for
+/// each unique track name. Drum tracks need no voices. Note tracks claim one
+/// voice each. Chord tracks claim N consecutive voices (N = the largest chord
+/// in that track across all sections).
+///
+/// Per-track waveforms are written into the engine here, once at startup.
+fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection> {
+    // First pass: build the global allocation table.
+    let mut alloc: HashMap<String, VoiceAlloc> = HashMap::new();
+    let mut next_voice: usize = 0;
+
+    for section in &pattern.sections {
+        for track in &section.tracks {
+            match &track.kind {
+                TrackKind::Drum(_) => {} // drums don't need pitched voices
+                TrackKind::Notes(_) => {
+                    if alloc.contains_key(&track.name) {
+                        continue;
+                    }
+                    if next_voice >= MAX_VOICES {
+                        eprintln!(
+                            "warning: note track {:?} dropped — only {} pitched voices available",
+                            track.name, MAX_VOICES
+                        );
+                        continue;
+                    }
+                    if let Some(wave) = track.wave {
+                        engine.set_voice_waveform(next_voice, wave);
+                    }
+                    alloc.insert(track.name.clone(), VoiceAlloc { base: next_voice, slots: 1 });
+                    next_voice += 1;
+                }
+                TrackKind::Chord(cells) => {
+                    let chord_size = max_chord_size(cells);
+                    if chord_size == 0 {
+                        continue;
+                    }
+
+                    if let Some(existing) = alloc.get(&track.name) {
+                        // Track appeared in an earlier section. If a later
+                        // section needs more slots than we allocated, we can't
+                        // safely expand without shifting everything else;
+                        // warn and the extra notes get dropped at dispatch.
+                        if existing.slots < chord_size {
+                            eprintln!(
+                                "warning: chord track {:?} has chords of {} notes in a later section but only {} voices reserved — extra notes will be dropped",
+                                track.name, chord_size, existing.slots
+                            );
+                        }
+                        continue;
+                    }
+
+                    if next_voice + chord_size > MAX_VOICES {
+                        eprintln!(
+                            "warning: chord track {:?} dropped — needs {} voices but only {} remain",
+                            track.name,
+                            chord_size,
+                            MAX_VOICES - next_voice
+                        );
+                        continue;
+                    }
+
+                    if let Some(wave) = track.wave {
+                        for v in next_voice..(next_voice + chord_size) {
+                            engine.set_voice_waveform(v, wave);
+                        }
+                    }
+                    alloc.insert(
+                        track.name.clone(),
+                        VoiceAlloc { base: next_voice, slots: chord_size },
+                    );
+                    next_voice += chord_size;
+                }
+            }
+        }
+    }
+
+    // Second pass: build per-section dispatch tables that reference the
+    // global voice allocations.
+    let mut resolved = Vec::with_capacity(pattern.sections.len());
+    for section in &pattern.sections {
+        let mut tracks = Vec::with_capacity(section.tracks.len());
+        let mut voice_set: Vec<usize> = Vec::new();
+        for track in &section.tracks {
+            match &track.kind {
+                TrackKind::Drum(hits) => {
+                    if let Some(drum) = resolve_drum(&track.name) {
+                        tracks.push(ResolvedTrack::Drum {
+                            drum,
+                            hits: hits.clone(),
+                        });
+                    }
+                }
+                TrackKind::Notes(cells) => {
+                    if let Some(va) = alloc.get(&track.name) {
+                        tracks.push(ResolvedTrack::Notes {
+                            voice_idx: va.base,
+                            cells: cells.clone(),
+                        });
+                        push_unique(&mut voice_set, va.base);
+                    }
+                }
+                TrackKind::Chord(cells) => {
+                    if let Some(va) = alloc.get(&track.name) {
+                        tracks.push(ResolvedTrack::Chord {
+                            voice_base: va.base,
+                            slots: va.slots,
+                            cells: cells.clone(),
+                        });
+                        for s in 0..va.slots {
+                            push_unique(&mut voice_set, va.base + s);
+                        }
+                    }
+                }
+            }
+        }
+        resolved.push(ResolvedSection {
+            name: section.name.clone(),
+            steps: section.steps,
+            tracks,
+            voice_set,
+        });
+    }
+    resolved
+}
+
+fn max_chord_size(cells: &[ChordCell]) -> usize {
+    cells
+        .iter()
+        .filter_map(|c| match c {
+            ChordCell::Chord(notes) => Some(notes.len()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn push_unique(v: &mut Vec<usize>, x: usize) {
+    if !v.contains(&x) {
+        v.push(x);
+    }
+}
+
+fn dispatch_step(
+    engine: &EngineHandle,
+    track: &ResolvedTrack,
+    step: usize,
+    target_sample: u64,
+) {
+    match track {
+        ResolvedTrack::Drum { drum, hits } => {
+            if hits[step] {
+                engine.schedule_at(*drum, target_sample);
+            }
+        }
+        ResolvedTrack::Notes { voice_idx, cells } => match cells[step] {
+            Cell::Note(midi) => {
+                engine.schedule_note_on(*voice_idx, target_sample, midi);
+            }
+            Cell::Rest => {
+                engine.schedule_note_off(*voice_idx, target_sample);
+            }
+            Cell::Sustain => {}
+        },
+        ResolvedTrack::Chord { voice_base, slots, cells } => match &cells[step] {
+            ChordCell::Chord(notes) => {
+                for s in 0..*slots {
+                    let voice = voice_base + s;
+                    if let Some(midi) = notes.get(s) {
+                        engine.schedule_note_on(voice, target_sample, *midi);
+                    } else {
+                        engine.schedule_note_off(voice, target_sample);
+                    }
+                }
+            }
+            ChordCell::Rest => {
+                for s in 0..*slots {
+                    engine.schedule_note_off(voice_base + s, target_sample);
+                }
+            }
+            ChordCell::Sustain => {}
+        },
     }
 }
 

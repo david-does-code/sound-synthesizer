@@ -80,14 +80,13 @@ This is the foundation for making actual music.
 - [x] **Slice 5b — Chord shorthand**: tokens like `Cm`, `G7`, `Fmaj7`, `Dsus4`
       expand to multi-note stacks via the new `TrackKind::Chord`. Auto-detected
       per row. Lets Claude compose from chord sheets directly.
+- [x] **Slice 5c — Song structure / pattern chaining**: `[section]` headers
+      define named patterns; `song: intro verse x2 chorus outro` chains them
+      into a real song with verse/chorus/bridge structure. Voice assignments
+      are global across sections so a `bass` line carries through cleanly.
+      Voices owned by tracks that disappear at a section boundary are released.
 
 **Next slices (in build order):**
-
-- [ ] **Slice 5c — Song structure / pattern chaining**: escape the 1-bar loop.
-      Either allow `steps: 64` for multi-bar patterns, or define multiple
-      `[pattern_name]` blocks plus a `song:` chain that names them in order
-      (intro → verse → chorus → verse → outro). **This is the single biggest
-      gap between "loop" and "song".**
 - [ ] **Slice 5d — Per-track ADSR**: each track can have its own envelope
       (`pad.attack: 200ms`, `bass.release: 50ms`). A pad swells in slowly;
       a pluck snaps and fades; a lead has fast attack with sustain. Currently

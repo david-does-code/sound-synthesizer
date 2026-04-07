@@ -1,0 +1,1 @@
+- [Concise commit messages](feedback_commit_messages.md) — keep commits short; subject-only when possible, body only for *why*

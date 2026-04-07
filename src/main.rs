@@ -429,43 +429,66 @@ fn play_pattern(path: &str) {
     println!("  🥁 Playing {path}");
     println!("  ────────────────────────────────────────");
     println!("  Tempo: {} BPM", pattern.bpm);
-    println!("  Steps: {}", pattern.steps);
-    println!("  Tracks:");
-    for t in &pattern.tracks {
-        let wave_label = match t.wave {
-            Some(w) => format!(" [{}]", w.name().to_lowercase()),
-            None => String::new(),
-        };
-        match &t.kind {
-            TrackKind::Drum(hits) => {
-                let visual: String = hits.iter().map(|h| if *h { 'x' } else { '-' }).collect();
-                println!("    🥁 {:<8}{wave_label} {}", t.name, visual);
+
+    // Song chain summary.
+    let chain: Vec<String> = pattern
+        .song
+        .iter()
+        .map(|e| {
+            if e.repeat == 1 {
+                e.section.clone()
+            } else {
+                format!("{} x{}", e.section, e.repeat)
             }
-            TrackKind::Notes(cells) => {
-                let visual: String = cells
-                    .iter()
-                    .map(|c| match c {
-                        Cell::Note(_) => 'N',
-                        Cell::Sustain => '.',
-                        Cell::Rest => '-',
-                    })
-                    .collect();
-                println!("    ♪  {:<8}{wave_label} {}", t.name, visual);
-            }
-            TrackKind::Chord(cells) => {
-                let visual: String = cells
-                    .iter()
-                    .map(|c| match c {
-                        ChordCell::Chord(_) => 'C',
-                        ChordCell::Sustain => '.',
-                        ChordCell::Rest => '-',
-                    })
-                    .collect();
-                println!("    ♬  {:<8}{wave_label} {}", t.name, visual);
+        })
+        .collect();
+    println!("  Song:  {}", chain.join("  →  "));
+    let total_bars: u32 = pattern
+        .song
+        .iter()
+        .map(|e| e.repeat)
+        .sum();
+    println!("  ({} sections, {} total plays per loop)", pattern.sections.len(), total_bars);
+    println!();
+
+    for section in &pattern.sections {
+        println!("  [{}]  ({} steps)", section.name, section.steps);
+        for t in &section.tracks {
+            let wave_label = match t.wave {
+                Some(w) => format!(" [{}]", w.name().to_lowercase()),
+                None => String::new(),
+            };
+            match &t.kind {
+                TrackKind::Drum(hits) => {
+                    let visual: String = hits.iter().map(|h| if *h { 'x' } else { '-' }).collect();
+                    println!("    🥁 {:<8}{wave_label} {}", t.name, visual);
+                }
+                TrackKind::Notes(cells) => {
+                    let visual: String = cells
+                        .iter()
+                        .map(|c| match c {
+                            Cell::Note(_) => 'N',
+                            Cell::Sustain => '.',
+                            Cell::Rest => '-',
+                        })
+                        .collect();
+                    println!("    ♪  {:<8}{wave_label} {}", t.name, visual);
+                }
+                TrackKind::Chord(cells) => {
+                    let visual: String = cells
+                        .iter()
+                        .map(|c| match c {
+                            ChordCell::Chord(_) => 'C',
+                            ChordCell::Sustain => '.',
+                            ChordCell::Rest => '-',
+                        })
+                        .collect();
+                    println!("    ♬  {:<8}{wave_label} {}", t.name, visual);
+                }
             }
         }
+        println!();
     }
-    println!();
     println!("  Press Enter to stop.");
 
     let engine = AudioEngine::new();
@@ -475,9 +498,8 @@ fn play_pattern(path: &str) {
     let sample_rate = engine_handle.sample_rate() as f64;
     let step_secs = 60.0 / pattern.bpm as f64 / 4.0;
     let samples_per_step = (step_secs * sample_rate).round() as u64;
-    let bar_secs = step_secs * pattern.steps as f64;
     println!(
-        "  audio: {sample_rate} Hz   step: {:.3} ms ({samples_per_step} samples)   bar: {bar_secs:.3} s",
+        "  audio: {sample_rate} Hz   step: {:.3} ms ({samples_per_step} samples/step)",
         step_secs * 1000.0
     );
     println!();
