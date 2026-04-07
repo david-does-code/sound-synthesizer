@@ -247,6 +247,7 @@ impl DrumVoice {
 pub struct EngineHandle {
     drum_schedule: Arc<[AtomicU64; NUM_DRUMS]>,
     voice_events: Arc<[AtomicU64; MAX_VOICES]>,
+    voice_waveforms: Arc<[AtomicU8; MAX_VOICES]>,
     sample_clock: Arc<AtomicU64>,
     sample_rate: f32,
 }
@@ -289,6 +290,14 @@ impl EngineHandle {
         if voice_idx < MAX_VOICES {
             let packed = pack_voice_event(EVENT_RELEASE, target_sample, 0);
             self.voice_events[voice_idx].store(packed, Ordering::Relaxed);
+        }
+    }
+
+    /// Set the waveform used by a single voice. Used by the sequencer to give
+    /// each track its own timbre. Takes effect on the next sample boundary.
+    pub fn set_voice_waveform(&self, voice_idx: usize, waveform: Waveform) {
+        if voice_idx < MAX_VOICES {
+            self.voice_waveforms[voice_idx].store(waveform as u8, Ordering::Relaxed);
         }
     }
 }
@@ -352,7 +361,13 @@ pub struct AudioEngine {
     /// set to false when its envelope finishes. The main thread reads
     /// this to find free voices for allocation.
     voice_active: Arc<[AtomicBool; MAX_VOICES]>,
+    /// Engine-wide default waveform (used by piano mode and as the seed for
+    /// new voices). When the user changes the global waveform, all per-voice
+    /// slots are updated to match.
     waveform: Arc<AtomicU8>,
+    /// Per-voice waveform — lets the sequencer give each track its own timbre.
+    /// The audio callback reads from here, not from the global `waveform`.
+    voice_waveforms: Arc<[AtomicU8; MAX_VOICES]>,
     adsr_packed: Arc<AtomicU64>,
     /// Per-drum scheduled trigger time (absolute audio sample), 0 = none.
     drum_schedule: Arc<[AtomicU64; NUM_DRUMS]>,
@@ -389,7 +404,11 @@ impl AudioEngine {
         let active_clone = voice_active.clone();
 
         let waveform = Arc::new(AtomicU8::new(Waveform::Sine as u8));
-        let wave_clone = waveform.clone();
+
+        let voice_waveforms: Arc<[AtomicU8; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU8::new(Waveform::Sine as u8)),
+        );
+        let voice_waveforms_clone = voice_waveforms.clone();
 
         let default_params = AdsrParams::default();
         let adsr_packed = Arc::new(AtomicU64::new(pack_adsr(&default_params)));
@@ -423,7 +442,11 @@ impl AudioEngine {
             .build_output_stream(
                 &config.into(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let wave = Waveform::from_u8(wave_clone.load(Ordering::Relaxed));
+                    // Snapshot per-voice waveforms once per buffer (cheap, and
+                    // avoids an atomic load per voice per frame).
+                    let voice_waves: [Waveform; MAX_VOICES] = std::array::from_fn(|i| {
+                        Waveform::from_u8(voice_waveforms_clone[i].load(Ordering::Relaxed))
+                    });
 
                     // Update ADSR params if changed
                     let current_adsr = adsr_clone.load(Ordering::Relaxed);
@@ -504,7 +527,7 @@ impl AudioEngine {
 
                         for (i, voice) in voices.iter_mut().enumerate() {
                             let was_active = voice.active;
-                            mix += voice.next_sample(wave);
+                            mix += voice.next_sample(voice_waves[i]);
                             // If voice just became inactive, update the shared flag
                             if was_active && !voice.active {
                                 active_clone[i].store(false, Ordering::Relaxed);
@@ -544,6 +567,7 @@ impl AudioEngine {
             voice_commands,
             voice_active,
             waveform,
+            voice_waveforms,
             adsr_packed,
             drum_schedule,
             voice_events,
@@ -558,6 +582,7 @@ impl AudioEngine {
         EngineHandle {
             drum_schedule: self.drum_schedule.clone(),
             voice_events: self.voice_events.clone(),
+            voice_waveforms: self.voice_waveforms.clone(),
             sample_clock: self.sample_clock.clone(),
             sample_rate: self.sample_rate,
         }
@@ -594,6 +619,11 @@ impl AudioEngine {
 
     pub fn set_waveform(&self, waveform: Waveform) {
         self.waveform.store(waveform as u8, Ordering::Relaxed);
+        // Broadcast to every voice so the piano (and any future "global"
+        // user-facing controls) affect all voices uniformly.
+        for slot in self.voice_waveforms.iter() {
+            slot.store(waveform as u8, Ordering::Relaxed);
+        }
     }
 
     pub fn waveform(&self) -> Waveform {

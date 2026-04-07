@@ -74,25 +74,48 @@ This is the foundation for making actual music.
 - [x] Melodic note tracks: scientific pitch notation (`C4`, `Eb3`, `F#5`),
       sustain (`.`) and rest (`-`) cells, up to 8 simultaneous note tracks
       sharing the pitched voice pool
+- [x] **Slice 5a — Per-track instruments**: each track declares its own
+      waveform (`bass.wave: sine`, `lead.wave: square`), so bass and lead
+      have different timbres. Per-voice waveform state in the audio engine.
+- [x] **Slice 5b — Chord shorthand**: tokens like `Cm`, `G7`, `Fmaj7`, `Dsus4`
+      expand to multi-note stacks via the new `TrackKind::Chord`. Auto-detected
+      per row. Lets Claude compose from chord sheets directly.
 
 **Next slices (in build order):**
-- [ ] **Slice 5a — Per-track instruments**: each track can declare its own
-      waveform (`wave: square`), so bass and lead can have different timbres.
-      Requires adding per-voice waveform state to the audio engine (currently
-      a single global `AtomicU8`).
-- [ ] **Slice 5b — Chord shorthand**: tokens like `Cm`, `G7`, `Dmaj`, `Fsus4`
-      expand to multi-note stacks that play simultaneously. Lets Claude compose
-      from chord sheets directly. Format: a `chord` track type that grabs
-      multiple voices.
-- [ ] **Slice 5c — Longer patterns / song chaining**: escape the 1-bar loop.
+
+- [ ] **Slice 5c — Song structure / pattern chaining**: escape the 1-bar loop.
       Either allow `steps: 64` for multi-bar patterns, or define multiple
       `[pattern_name]` blocks plus a `song:` chain that names them in order
-      (intro → verse → chorus → verse → outro).
-- [ ] **Slice 5d — Visual grid in the TUI**: third UI mode (after piano/ADSR)
-      that shows the pattern grid with a moving playhead.
-- [ ] **Slice 5e — TUI editing**: toggle steps with arrow keys + space, save
+      (intro → verse → chorus → verse → outro). **This is the single biggest
+      gap between "loop" and "song".**
+- [ ] **Slice 5d — Per-track ADSR**: each track can have its own envelope
+      (`pad.attack: 200ms`, `bass.release: 50ms`). A pad swells in slowly;
+      a pluck snaps and fades; a lead has fast attack with sustain. Currently
+      every voice shares the global ADSR.
+- [ ] **Slice 5e — Per-track volume / mixing**: `kick.gain: 1.0`,
+      `hihat.gain: 0.4`. Lets the kick punch while the hi-hat sits behind.
+      Without mixing, all tracks come out at the same level which feels flat.
+- [ ] **Slice 5f — Velocity / dynamics**: per-cell loudness. Today every hit
+      is the same volume. Real music has accents (loud beats), ghost notes
+      (quiet snare hits), swells. Probable syntax: `kick: X---x---X---x---`
+      where capital `X` is accented and lowercase `x` is normal. For note
+      tracks, maybe `C4!` for accented and `C4?` for ghost.
+- [ ] **Slice 5g — Note gate length**: how long a note holds within its
+      step (staccato vs legato). Currently a note plays from trigger to next
+      trigger/rest. Probable syntax: a track-level `gate: 0.5` (half-step),
+      or per-cell `C4/2` (held for half a step).
+- [ ] **Slice 5h — Swing / shuffle**: nudge every other 16th-note slightly
+      late so the rhythm "breathes". Track property: `swing: 0.15` (= 15%
+      shuffle). The difference between a robotic beat and one that grooves.
+- [ ] **Slice 5i — Tempo / time signature changes**: tempo curves (`bpm:
+      120 → 140 over 8 bars`), time signature changes (`time: 6/8`), and
+      multiple time signatures within a song. Today we're locked to 4/4 at
+      a fixed BPM.
+- [ ] **Slice 5j — Visual grid in the TUI**: third UI mode (after piano/ADSR)
+      showing the pattern grid with a moving playhead.
+- [ ] **Slice 5k — TUI editing**: toggle steps with arrow keys + space, save
       back to `.pat` files. Live-reload while playing.
-- [ ] Export a played pattern to WAV (offline render).
+- [ ] **Slice 5l — Export pattern/song to WAV**: offline render.
 
 **Concepts learned so far**: tempo and BPM, beats and bars, 16th-note subdivisions
 in 4/4, drum kit anatomy (kick on the downbeat, snare on the backbeat, hi-hat
@@ -140,51 +163,77 @@ basics, click tracks, the relationship between recording and performance.
 
 ### Pattern File Format (current)
 
-Human-readable text files that both the TUI and Claude can read/write. The
-format supports drum tracks (single-char cells: `x` = hit, `-`/`.` = rest)
-and note tracks (whitespace-separated tokens: note names like `C4`, `Eb3`,
-`F#5`, plus `-` rest and `.` sustain).
+Human-readable text files that both the TUI and Claude can read/write. Three
+kinds of tracks:
+
+- **Drum tracks**: single-char cells (`x` = hit, `-`/`.` = rest)
+- **Note tracks**: whitespace-separated tokens — note names like `C4`, `Eb3`,
+  `F#5`, plus `-` rest and `.` sustain
+- **Chord tracks**: chord shorthand tokens like `Cm`, `G7`, `Fmaj7`, `Dsus4`,
+  played as multi-note stacks
+
+Per-track properties: `name.wave: <sine|square|saw|triangle>` and
+`name.octave: <int>` (chord root octave). Auto-detection picks the right
+track kind from row contents.
 
 ```
-# C minor groove with drums and a walking bass + lead riff.
-bpm: 110
+# C minor cinematic groove: drums + sine bass + triangle pad + square lead.
+bpm: 96
 steps: 16
 
 kick:    x---x---x---x---
 snare:   ----x-------x---
 hihat:   x-x-x-x-x-x-x-x-
 
-bass:    C2  .  .  .  Eb2 .  .  .  G2  .  .  .  F2  .  .  .
-lead:    Eb4 F4 G4 Bb4 C5  .  Bb4 G4 F4  .  Eb4 .  D4  .  C4  .
+bass.wave: sine
+bass:    C2  .  .  .  Ab1 .  .  .  Eb2 .  .  .  Bb1 .  .  .
+
+pad.wave: triangle
+pad.octave: 4
+pad:     Cm  .  .  .  Ab  .  .  .  Eb  .  .  .  Bb  .  .  .
+
+lead.wave: square
+lead:    G4  .  Eb4 . C5  .  G4  .  Bb4 .  G4  .  F4  .  D4  .
 ```
 
-The parser auto-detects per row whether it's a drum or note track. Track
-names map to drum kinds (`kick`/`bd`, `snare`/`sd`, `hihat`/`hh`/`hat`) or
-become melodic note tracks. Note tracks consume voices in declaration order
-from the shared 8-voice pitched pool. Comments with `#` only at the start
-of a line (so `F#4` parses as F-sharp 4, not "F" followed by a comment).
+Track names map to drum kinds (`kick`/`bd`, `snare`/`sd`, `hihat`/`hh`/`hat`)
+or become melodic / chord tracks consuming voices from the 8-voice pitched
+pool in declaration order. Comments use `#` and must start at the beginning
+of a line so `F#4` parses as F-sharp 4.
 
-Coming soon (slices 5a-5c): per-track `wave:` declarations, `chord` track
-type with shorthand like `Cm`, `G7`, `Dmaj`, and either `steps: 64` or a
-`song:` chain across multiple `[pattern_name]` blocks.
+Coming soon (slices 5c-5i): song chaining across multi-bar blocks, per-track
+ADSR, gain, velocity, gate length, swing, tempo curves, and time-signature
+changes.
 
-### Phase 8: Filters & Effects
+### Phase 8: Filters, Effects & Modulation
 
-Once there's actual music to process, add filters and effects as creative tools.
+Once there's actual music to process, add filters, effects, and modulation
+sources as creative tools.
 
-- [ ] Low-pass / high-pass filters with cutoff and resonance
-- [ ] Delay / echo
-- [ ] Reverb
+**Filters & effects:**
+- [ ] Low-pass / high-pass / band-pass filters with cutoff and resonance
+- [ ] Delay / echo (with feedback)
+- [ ] Reverb (room, hall, plate)
+- [ ] Chorus / detune
 - [ ] Per-track filter and effect controls
 
+**Modulation:**
+- [ ] LFO (low-frequency oscillator) — slow sine/triangle that can modulate
+      pitch (vibrato), amplitude (tremolo), filter cutoff (wobble), or pan.
+- [ ] Vibrato — periodic pitch wobble, makes voices feel "alive" and human.
+- [ ] Pitch bend — smooth glide from one note to another (portamento / glissando).
+- [ ] Filter envelope — separate ADSR routed to filter cutoff for "wow" sweeps.
+
 **Concepts to learn**: frequency spectrum, filter types, subtractive synthesis,
-delay lines, feedback loops, how physical spaces shape sound.
+delay lines, feedback loops, how physical spaces shape sound, modulation routing,
+why "moving" parameters make sound feel alive vs static.
 
 ## Stretch Goals
 
 - [ ] Full TUI with ratatui (waveform display, knobs, keyboard visualization)
-- [ ] MIDI input support (connect a real MIDI keyboard)
 - [ ] Wavetable synthesis
 - [ ] FM synthesis
-- [ ] Import chord sheets / lead sheets from text
-- [ ] Live recording — play into the sequencer in real time
+- [ ] Granular synthesis
+- [ ] Import standard chord sheets / lead sheets / MusicXML / MIDI files
+- [ ] Built-in songbook of well-known progressions and grooves to learn from
+- [ ] Polyrhythms (different tracks with different step counts running together)

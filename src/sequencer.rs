@@ -28,7 +28,7 @@
 //! never when playback happens.
 
 use crate::audio::{Drum, EngineHandle, MAX_VOICES};
-use crate::pattern::{Cell, Pattern, TrackKind};
+use crate::pattern::{Cell, ChordCell, Pattern, TrackKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -51,6 +51,14 @@ enum ResolvedTrack {
     Notes {
         voice_idx: usize,
         cells: Vec<Cell>,
+    },
+    /// A chord track owns N consecutive voices starting at `voice_base`.
+    /// `slots` is N — the number of simultaneous notes the track can play
+    /// (the largest chord encountered).
+    Chord {
+        voice_base: usize,
+        slots: usize,
+        cells: Vec<ChordCell>,
     },
 }
 
@@ -76,7 +84,9 @@ impl Sequencer {
         let samples_per_step = (step_secs * sample_rate).round() as u64;
 
         // Resolve every track once, up-front. Note tracks consume voice indices
-        // 0..n in the order they appear; tracks beyond MAX_VOICES are dropped.
+        // 0..n in the order they appear; chord tracks consume a contiguous block
+        // of voices equal to their max chord size. Tracks that don't fit in
+        // MAX_VOICES are dropped with a warning.
         let mut resolved: Vec<ResolvedTrack> = Vec::with_capacity(pattern.tracks.len());
         let mut next_voice: usize = 0;
         for track in &pattern.tracks {
@@ -97,11 +107,49 @@ impl Sequencer {
                         );
                         continue;
                     }
+                    if let Some(wave) = track.wave {
+                        engine.set_voice_waveform(next_voice, wave);
+                    }
                     resolved.push(ResolvedTrack::Notes {
                         voice_idx: next_voice,
                         cells: cells.clone(),
                     });
                     next_voice += 1;
+                }
+                TrackKind::Chord(cells) => {
+                    let max_chord = cells
+                        .iter()
+                        .filter_map(|c| match c {
+                            ChordCell::Chord(notes) => Some(notes.len()),
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    if max_chord == 0 {
+                        // Track has no actual chords — skip it.
+                        continue;
+                    }
+                    if next_voice + max_chord > MAX_VOICES {
+                        eprintln!(
+                            "warning: chord track {:?} dropped — needs {} voices but only {} remain",
+                            track.name,
+                            max_chord,
+                            MAX_VOICES - next_voice
+                        );
+                        continue;
+                    }
+                    let voice_base = next_voice;
+                    if let Some(wave) = track.wave {
+                        for v in voice_base..(voice_base + max_chord) {
+                            engine.set_voice_waveform(v, wave);
+                        }
+                    }
+                    resolved.push(ResolvedTrack::Chord {
+                        voice_base,
+                        slots: max_chord,
+                        cells: cells.clone(),
+                    });
+                    next_voice += max_chord;
                 }
             }
         }
@@ -141,6 +189,29 @@ impl Sequencer {
                                 // Nothing to do — voice keeps playing.
                             }
                         },
+                        ResolvedTrack::Chord { voice_base, slots, cells } => match &cells[step] {
+                            ChordCell::Chord(notes) => {
+                                // Trigger one note per voice slot. Any extra
+                                // slots beyond this chord's note count get
+                                // released so previous notes don't linger.
+                                for s in 0..*slots {
+                                    let voice = voice_base + s;
+                                    if let Some(midi) = notes.get(s) {
+                                        engine.schedule_note_on(voice, target_sample, *midi);
+                                    } else {
+                                        engine.schedule_note_off(voice, target_sample);
+                                    }
+                                }
+                            }
+                            ChordCell::Rest => {
+                                for s in 0..*slots {
+                                    engine.schedule_note_off(voice_base + s, target_sample);
+                                }
+                            }
+                            ChordCell::Sustain => {
+                                // Voices keep playing.
+                            }
+                        },
                     }
                 }
 
@@ -160,8 +231,16 @@ impl Sequencer {
             // On stop, release any voices we own so they fade out cleanly.
             let release_at = engine.current_sample() + 1;
             for track in &resolved {
-                if let ResolvedTrack::Notes { voice_idx, .. } = track {
-                    engine.schedule_note_off(*voice_idx, release_at);
+                match track {
+                    ResolvedTrack::Notes { voice_idx, .. } => {
+                        engine.schedule_note_off(*voice_idx, release_at);
+                    }
+                    ResolvedTrack::Chord { voice_base, slots, .. } => {
+                        for s in 0..*slots {
+                            engine.schedule_note_off(voice_base + s, release_at);
+                        }
+                    }
+                    ResolvedTrack::Drum { .. } => {}
                 }
             }
         });

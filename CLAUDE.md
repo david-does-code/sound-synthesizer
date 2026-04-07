@@ -10,32 +10,41 @@ See PLAN.md for the roadmap and current progress.
 - `src/audio.rs` — Polyphonic audio engine with 8 pitched voices plus 3 dedicated drum
   voices (kick, snare, hi-hat) synthesized inside the callback. Lock-free communication:
   `voice_commands` (`[AtomicU32; 8]` for immediate piano play/release), `voice_active`
-  (`[AtomicBool; 8]`), waveform (`AtomicU8`), ADSR params (packed `AtomicU64`),
-  `drum_schedule` (`[AtomicU64; 3]` holding absolute audio sample numbers for
-  sample-accurate drum triggers), `voice_events` (`[AtomicU64; 8]` packed (kind, midi,
-  sample) for sample-accurate note scheduling by the sequencer), and `sample_clock`
-  (`AtomicU64`, advanced per-frame by the callback). Contains `Waveform`, `Drum`,
-  `DrumVoice`, and `EngineHandle` — a clonable Send + Sync control surface used by
-  the sequencer to schedule drums *and* pitched notes.
+  (`[AtomicBool; 8]`), global `waveform` (`AtomicU8`, used by piano mode + as a default),
+  per-voice `voice_waveforms` (`[AtomicU8; 8]`, lets each track have its own timbre,
+  read by the audio callback), ADSR params (packed `AtomicU64`), `drum_schedule`
+  (`[AtomicU64; 3]` holding absolute audio sample numbers for sample-accurate drum
+  triggers), `voice_events` (`[AtomicU64; 8]` packed (kind, midi, sample) for
+  sample-accurate note scheduling by the sequencer), and `sample_clock` (`AtomicU64`,
+  advanced per-frame by the callback). Contains `Waveform`, `Drum`, `DrumVoice`, and
+  `EngineHandle` — a clonable Send + Sync control surface used by the sequencer to
+  schedule drums + pitched notes and to set per-voice waveforms.
 - `src/envelope.rs` — ADSR envelope generator. Per-sample state machine (Idle → Attack →
   Decay → Sustain → Release → Idle). Lives inside the audio callback closure.
 - `src/keyboard.rs` — Reads raw keyboard events from Linux evdev (`/dev/input/`).
   Sends note, waveform, octave, mode toggle, and arrow key events over an MPSC channel.
-- `src/pattern.rs` — Pattern file format and parser. Defines `Pattern`, `Track`,
-  `TrackKind` (`Drum(Vec<bool>)` or `Notes(Vec<Cell>)`), `Cell` (`Rest | Sustain |
-  Note(u8)`), and `PatternParseError`. Format is line-based: `bpm:`/`steps:` headers,
-  then track rows. Auto-detects per row: rows containing only `xX-./whitespace` are
-  drum rows; anything else is a note row with whitespace-separated tokens (note names
-  like `C4`, `Eb3`, `F#5`, plus `-` rest and `.` sustain). `parse_note_name` handles
-  scientific pitch notation (middle C = C4 = MIDI 60). Comments with `#` are line-only
-  (must be at line start) so `F#4` parses as F-sharp 4. Parser errors carry line numbers.
+- `src/pattern.rs` — Pattern file format and parser. Defines `Pattern`, `Track` (with
+  optional `wave` property), `TrackKind` (`Drum(Vec<bool>)` / `Notes(Vec<Cell>)` /
+  `Chord(Vec<ChordCell>)`), `Cell` and `ChordCell` (each: `Rest | Sustain | Note(...)`),
+  and `PatternParseError`. Format is line-based: `bpm:`/`steps:` headers, then track
+  rows and per-track property lines (`name.wave: square`, `name.octave: 4`). Two-pass
+  parser: pass 1 collects properties, pass 2 builds tracks (so properties can be
+  declared before *or* after the track row). Auto-detects per row: drum rows contain
+  only `xX-./whitespace`; chord rows contain at least one unambiguous chord token like
+  `Cm`/`Gmaj7`/`Fdim`; everything else is a note row. `parse_note_name` handles
+  scientific pitch notation (middle C = C4 = MIDI 60); `parse_chord_shorthand` handles
+  major/minor/7/maj7/m7/dim/dim7/aug/sus2/sus4 with sharps and flats. Comments with `#`
+  are line-only (must start at line start) so `F#4` parses as F-sharp 4. Parser errors
+  carry line numbers and track names.
 - `src/sequencer.rs` — Step sequencer that plays a `Pattern` via a background thread.
   Uses sample-accurate scheduling via `EngineHandle`: pre-computes the absolute audio
   sample for each step and writes it to per-drum/per-voice atomic slots, so playback
   timing is independent of scheduler thread wall-clock jitter. Drum tracks route by
-  name (kick/bd, snare/sd, hihat/hh/hat); note tracks consume voice indices 0..n in
-  declaration order from the 8-voice pitched pool. Releases all owned voices on stop.
-  Lookahead is ~100 ms.
+  name (kick/bd, snare/sd, hihat/hh/hat); note tracks consume one voice each from the
+  8-voice pitched pool in declaration order; chord tracks consume a contiguous block
+  of N voices where N is the largest chord size in the track. Per-track waveform is
+  applied via `set_voice_waveform` when the track is resolved. Releases all owned
+  voices on stop. Lookahead is ~100 ms.
 - `src/main.rs` — Two interactive modes (piano + ADSR editor, Tab toggles) plus a CLI
   pattern player: `cargo run -- --play <file.pat>` loads a pattern and plays it in a
   loop until Enter is pressed. `--help` lists usage.
@@ -92,8 +101,9 @@ See PLAN.md for the roadmap and current progress.
 
 ## What's Next
 
-Check PLAN.md — Phases 1-4 are complete. Phase 5 is in progress: step sequencer with
-text-based pattern files. Done so far: parser, drum synthesis, sequencer engine,
-sample-accurate timing, melodic note tracks (slice 4). Next up: per-track instruments
-(`wave: square`), chord shorthand (`Cm`, `G7`), longer patterns / song chaining, then
-a TUI grid view + editor.
+Check PLAN.md — Phases 1-4 are complete. Phase 5 (sequencer + composition) is in
+progress. Done: parser, drum synthesis, sequencer engine, sample-accurate timing,
+melodic note tracks, per-track instruments (slice 5a), chord shorthand (slice 5b).
+Next up: song structure / pattern chaining (5c) — the biggest gap between "loop"
+and "song". Then per-track ADSR / mix / dynamics / gate / swing / tempo changes,
+then TUI grid view + editor.

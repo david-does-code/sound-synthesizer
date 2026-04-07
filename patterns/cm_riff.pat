@@ -1,4 +1,4 @@
-# C minor groove with a bass line and a lead riff playing on top.
+# C minor groove with a sine bass and a square-wave lead — chiptune flavor.
 # The lead plays an Eb major scale fragment up and back down, while
 # the bass walks through the chord tones.
 
@@ -9,5 +9,8 @@ kick:    x---x---x---x---
 snare:   ----x-------x---
 hihat:   x-x-x-x-x-x-x-x-
 
+bass.wave: sine
 bass:    C2  .  .  .  Eb2 .  .  .  G2  .  .  .  F2  .  .  .
+
+lead.wave: square
 lead:    Eb4 F4 G4 Bb4 C5  .  Bb4 G4 F4  .  Eb4 .  D4  .  C4  .

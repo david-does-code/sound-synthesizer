@@ -1,14 +1,14 @@
 //! Pattern file format and parser.
 //!
-//! A pattern is a step-sequenced piece of music. There are two kinds of tracks:
+//! A pattern is a step-sequenced piece of music. Three kinds of tracks:
 //!
 //! ### Drum tracks
 //!
 //! Each cell is a single character: `x` (or `X`) means trigger, `-` (or `.`)
-//! means rest. Whitespace inside the cell string is ignored, so the row can be
-//! written either as `x---x---` or as `x - - - x - - -`.
+//! means rest. Whitespace inside the row is ignored, so it can be written as
+//! either `x---x---` or `x - - - x - - -`.
 //!
-//! ### Note tracks
+//! ### Note tracks (monophonic)
 //!
 //! Each cell is a whitespace-separated **token**:
 //!
@@ -19,11 +19,32 @@
 //! Octaves use scientific pitch notation: middle C is `C4` = MIDI 60.
 //! Accidentals: `#` for sharp, `b` for flat.
 //!
+//! ### Chord tracks (polyphonic)
+//!
+//! Each cell is either `-`, `.`, or a **chord shorthand** like `Cm`, `G7`,
+//! `Fmaj7`, `Dsus4`. The parser expands the shorthand to the component notes,
+//! which are played simultaneously across multiple voices. Supported chord
+//! types: major (`C`), minor (`Cm` / `Cmin`), dominant 7 (`C7`), major 7
+//! (`Cmaj7`), minor 7 (`Cm7`), diminished (`Cdim`), diminished 7 (`Cdim7`),
+//! augmented (`Caug`), suspended 2 (`Csus2`), suspended 4 (`Csus4`).
+//!
+//! Default octave for chord roots is 3, configurable via `name.octave: N`.
+//!
+//! ### Per-track properties
+//!
+//! Lines like `name.wave: square` set a property on a track. Currently:
+//!
+//! - `name.wave: <sine|square|saw|triangle>` — waveform for the track's voices
+//! - `name.octave: <int>` — root octave for chord tracks (default 3)
+//!
+//! Property lines can appear before or after the track row.
+//!
 //! ### Auto-detection
 //!
-//! The parser decides whether a track is a drum or note track from the row
-//! contents: if every non-whitespace character is one of `xX-.`, it's parsed
-//! as a drum track; otherwise as a note track.
+//! The parser decides each track's kind from the row contents:
+//! 1. Only `xX-.` characters → drum track
+//! 2. Any token that's a chord shorthand (e.g. `Cm`, `Gmaj7`) → chord track
+//! 3. Otherwise → note track
 //!
 //! ### Example
 //!
@@ -34,17 +55,32 @@
 //! kick:    x---x---x---x---
 //! snare:   ----x-------x---
 //! hihat:   x-x-x-x-x-x-x-x-
+//!
+//! bass.wave: sine
 //! bass:    C2 . . . Eb2 . . . G2 . . . Bb2 . . .
+//!
+//! lead.wave: square
+//! lead:    Eb4 F4 G4 Bb4 C5 . Bb4 G4 F4 . Eb4 . D4 . C4 .
+//!
+//! pad.wave: triangle
+//! pad.octave: 4
+//! pad:     Cm . . . Fm . . . Gm . . . Cm . . .
 //! ```
 //!
-//! Lines starting with `#` are comments. Blank lines are ignored. Header keys
-//! (`bpm`, `steps`) must appear before any track lines.
+//! Lines starting with `#` (at the beginning of the line) are comments. Blank
+//! lines are ignored. Header keys (`bpm`, `steps`) must appear before any
+//! track lines.
 
 #![allow(dead_code)]
 
+use crate::audio::Waveform;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+
+/// Default octave for chord roots when no `track.octave: N` property is set.
+const DEFAULT_CHORD_OCTAVE: i32 = 3;
 
 /// A parsed pattern: tempo, length, and a set of tracks.
 #[derive(Debug, Clone, PartialEq)]
@@ -59,18 +95,23 @@ pub struct Pattern {
 pub struct Track {
     pub name: String,
     pub kind: TrackKind,
+    /// Optional per-track waveform override (`name.wave: square`).
+    pub wave: Option<Waveform>,
 }
 
-/// Either a percussive trigger track or a melodic note track.
+/// What this track plays.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrackKind {
     /// Drum-style track. `hits[i] == true` means trigger the drum at step `i`.
     Drum(Vec<bool>),
-    /// Melodic note track. One [`Cell`] per step.
+    /// Monophonic note track. One [`Cell`] per step.
     Notes(Vec<Cell>),
+    /// Polyphonic chord track. One [`ChordCell`] per step. Each chord plays
+    /// all of its notes simultaneously across multiple voices.
+    Chord(Vec<ChordCell>),
 }
 
-/// One cell of a note track.
+/// One cell of a monophonic note track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cell {
     /// Release any held note and stay silent.
@@ -79,6 +120,17 @@ pub enum Cell {
     Sustain,
     /// Trigger the given MIDI note (releasing any previous one on this track).
     Note(u8),
+}
+
+/// One cell of a polyphonic chord track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChordCell {
+    /// Release any held notes and stay silent.
+    Rest,
+    /// Continue holding whatever chord is currently playing.
+    Sustain,
+    /// Trigger the given set of MIDI notes simultaneously.
+    Chord(Vec<u8>),
 }
 
 /// Errors that can occur while parsing a pattern file.
@@ -108,6 +160,17 @@ pub enum PatternParseError {
         line: usize,
         token: String,
     },
+    UnknownProperty {
+        line: usize,
+        track: String,
+        prop: String,
+    },
+    InvalidPropertyValue {
+        line: usize,
+        track: String,
+        prop: String,
+        value: String,
+    },
     Io(String),
 }
 
@@ -132,7 +195,15 @@ impl fmt::Display for PatternParseError {
             ),
             Self::InvalidNoteToken { line, token } => write!(
                 f,
-                "line {line}: invalid note token {token:?} (expected a note name like C4, Eb3, F#5, or `-`/`.`)"
+                "line {line}: invalid note token {token:?} (expected a note name like C4, Eb3, F#5, a chord like Cm or G7, or `-`/`.`)"
+            ),
+            Self::UnknownProperty { line, track, prop } => write!(
+                f,
+                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave)"
+            ),
+            Self::InvalidPropertyValue { line, track, prop, value } => write!(
+                f,
+                "line {line}: invalid value {value:?} for {track:?}.{prop} property"
             ),
             Self::Io(e) => write!(f, "i/o error: {e}"),
         }
@@ -149,7 +220,31 @@ impl Pattern {
     }
 
     /// Parse a pattern from a string.
+    ///
+    /// Two passes: the first collects per-track properties (so they can be
+    /// declared either before or after the track row), the second builds the
+    /// header values and the tracks themselves.
     pub fn parse(text: &str) -> Result<Self, PatternParseError> {
+        // ── pass 1: collect per-track properties ───────────────────────────
+        let mut props: HashMap<String, TrackProps> = HashMap::new();
+        for (idx, raw_line) in text.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = strip_comment(raw_line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                continue; // pass 2 will report the malformed line
+            };
+            let key = key.trim();
+            let value = value.trim();
+            if let Some((track_name, prop_name)) = key.split_once('.') {
+                let entry = props.entry(track_name.trim().to_string()).or_default();
+                apply_property(line_no, track_name.trim(), prop_name.trim(), value, entry)?;
+            }
+        }
+
+        // ── pass 2: parse headers and tracks ───────────────────────────────
         let mut bpm: Option<u32> = None;
         let mut steps: Option<usize> = None;
         let mut tracks: Vec<Track> = Vec::new();
@@ -171,6 +266,11 @@ impl Pattern {
                 }
             };
 
+            // Skip property lines (already processed in pass 1).
+            if key.contains('.') {
+                continue;
+            }
+
             match key {
                 "bpm" => {
                     bpm = Some(parse_header_num(line_no, key, value)?);
@@ -181,14 +281,19 @@ impl Pattern {
                 _ => {
                     let expected =
                         steps.ok_or(PatternParseError::MissingHeader("steps"))?;
+                    let track_props = props.get(key).cloned().unwrap_or_default();
                     let kind = if looks_like_drum_track(value) {
                         TrackKind::Drum(parse_drum_row(line_no, value, expected)?)
+                    } else if row_is_chord(value) {
+                        let octave = track_props.octave.unwrap_or(DEFAULT_CHORD_OCTAVE);
+                        TrackKind::Chord(parse_chord_row(line_no, value, expected, octave)?)
                     } else {
                         TrackKind::Notes(parse_note_row(line_no, value, expected)?)
                     };
                     tracks.push(Track {
                         name: key.to_string(),
                         kind,
+                        wave: track_props.wave,
                     });
                 }
             }
@@ -199,6 +304,66 @@ impl Pattern {
             steps: steps.ok_or(PatternParseError::MissingHeader("steps"))?,
             tracks,
         })
+    }
+}
+
+/// Per-track properties accumulated in pass 1 of parsing.
+#[derive(Default, Debug, Clone)]
+struct TrackProps {
+    wave: Option<Waveform>,
+    octave: Option<i32>,
+}
+
+fn apply_property(
+    line_no: usize,
+    track: &str,
+    prop: &str,
+    value: &str,
+    out: &mut TrackProps,
+) -> Result<(), PatternParseError> {
+    match prop {
+        "wave" => {
+            let wave = parse_waveform(value).ok_or_else(|| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.wave = Some(wave);
+        }
+        "octave" => {
+            let oct: i32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.octave = Some(oct);
+        }
+        _ => {
+            return Err(PatternParseError::UnknownProperty {
+                line: line_no,
+                track: track.to_string(),
+                prop: prop.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Parse a waveform name (case-insensitive). Accepts `sine`, `square`,
+/// `saw`/`sawtooth`, `triangle`/`tri`.
+fn parse_waveform(s: &str) -> Option<Waveform> {
+    match s.to_ascii_lowercase().as_str() {
+        "sine" | "sin" => Some(Waveform::Sine),
+        "square" | "sq" => Some(Waveform::Square),
+        "saw" | "sawtooth" => Some(Waveform::Sawtooth),
+        "triangle" | "tri" => Some(Waveform::Triangle),
+        _ => None,
     }
 }
 
@@ -299,6 +464,133 @@ fn parse_note_row(
     Ok(cells)
 }
 
+/// True if `value` looks like a chord row — i.e., contains at least one
+/// token that is unambiguously a chord shorthand (a token that can't be parsed
+/// as a single note). Tokens like `C7` are ambiguous (could be either a note
+/// in octave 7 or C dominant 7) and don't on their own trigger chord mode;
+/// the row needs at least one unambiguous chord token like `Cm`, `Gmaj7`,
+/// `Fdim`, `Asus4`, etc.
+fn row_is_chord(value: &str) -> bool {
+    for token in value.split_whitespace() {
+        if matches!(token, "-" | ".") {
+            continue;
+        }
+        // If it parses as a plain note, it doesn't qualify on its own.
+        if parse_note_name(token).is_some() {
+            continue;
+        }
+        // If it parses as a chord, this row is a chord row.
+        if parse_chord_shorthand(token, DEFAULT_CHORD_OCTAVE).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_chord_row(
+    line_no: usize,
+    value: &str,
+    expected: usize,
+    octave: i32,
+) -> Result<Vec<ChordCell>, PatternParseError> {
+    let mut cells = Vec::with_capacity(expected);
+    for token in value.split_whitespace() {
+        let cell = match token {
+            "-" => ChordCell::Rest,
+            "." => ChordCell::Sustain,
+            other => match parse_chord_shorthand(other, octave) {
+                Some(notes) => ChordCell::Chord(notes),
+                None => {
+                    return Err(PatternParseError::InvalidNoteToken {
+                        line: line_no,
+                        token: other.to_string(),
+                    });
+                }
+            },
+        };
+        cells.push(cell);
+    }
+    if cells.len() != expected {
+        return Err(PatternParseError::WrongStepCount {
+            line: line_no,
+            track: String::new(),
+            expected,
+            got: cells.len(),
+        });
+    }
+    Ok(cells)
+}
+
+/// Parse a chord shorthand like `Cm`, `G7`, `Fmaj7`, `Dsus4` into a vector of
+/// MIDI notes. The root pitch class is taken from the first 1-2 characters
+/// (note letter + optional accidental); the rest is the chord type.
+///
+/// Supported chord types and their semitone intervals (from the root):
+///
+/// | Suffix              | Type             | Intervals       |
+/// |---------------------|------------------|------------------|
+/// | (empty)             | major triad      | 0, 4, 7          |
+/// | `m` / `min`         | minor triad      | 0, 3, 7          |
+/// | `7`                 | dominant 7       | 0, 4, 7, 10      |
+/// | `maj7` / `M7`       | major 7          | 0, 4, 7, 11      |
+/// | `m7` / `min7`       | minor 7          | 0, 3, 7, 10      |
+/// | `dim`               | diminished       | 0, 3, 6          |
+/// | `dim7`              | diminished 7     | 0, 3, 6, 9       |
+/// | `aug` / `+`         | augmented        | 0, 4, 8          |
+/// | `sus2`              | suspended 2nd    | 0, 2, 7          |
+/// | `sus4`              | suspended 4th    | 0, 5, 7          |
+pub fn parse_chord_shorthand(s: &str, default_octave: i32) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    // Note letter
+    let pitch_class: i32 = match bytes[0].to_ascii_uppercase() {
+        b'C' => 0,
+        b'D' => 2,
+        b'E' => 4,
+        b'F' => 5,
+        b'G' => 7,
+        b'A' => 9,
+        b'B' => 11,
+        _ => return None,
+    };
+
+    // Optional accidental
+    let (accidental, suffix_start): (i32, usize) = match bytes.get(1) {
+        Some(b'#') => (1, 2),
+        Some(b'b') => (-1, 2),
+        _ => (0, 1),
+    };
+
+    let suffix = &s[suffix_start..];
+    let intervals: &[i32] = match suffix {
+        "" => &[0, 4, 7],
+        "m" | "min" => &[0, 3, 7],
+        "7" => &[0, 4, 7, 10],
+        "maj7" | "M7" => &[0, 4, 7, 11],
+        "m7" | "min7" => &[0, 3, 7, 10],
+        "dim" => &[0, 3, 6],
+        "dim7" => &[0, 3, 6, 9],
+        "aug" | "+" => &[0, 4, 8],
+        "sus2" => &[0, 2, 7],
+        "sus4" => &[0, 5, 7],
+        _ => return None,
+    };
+
+    let root_midi = (default_octave + 1) * 12 + pitch_class + accidental;
+    let mut notes = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        let midi = root_midi + interval;
+        if !(0..=127).contains(&midi) {
+            return None;
+        }
+        notes.push(midi as u8);
+    }
+    Some(notes)
+}
+
 /// Parse a note name like `C4`, `C#3`, `Eb2`, `F#5` into a MIDI note number.
 /// Uses scientific pitch notation: middle C = `C4` = MIDI 60.
 pub fn parse_note_name(s: &str) -> Option<u8> {
@@ -358,6 +650,13 @@ mod tests {
         match &track.kind {
             TrackKind::Notes(c) => c,
             _ => panic!("expected note track, got {:?}", track.kind),
+        }
+    }
+
+    fn chords(track: &Track) -> &Vec<ChordCell> {
+        match &track.kind {
+            TrackKind::Chord(c) => c,
+            _ => panic!("expected chord track, got {:?}", track.kind),
         }
     }
 
@@ -586,5 +885,187 @@ hat: x - x - x - x -
             PatternParseError::InvalidHeaderValue { key, .. } => assert_eq!(key, "bpm"),
             other => panic!("expected InvalidHeaderValue, got {other:?}"),
         }
+    }
+
+    // ── slice 5a: per-track properties ─────────────────────────────────────
+
+    #[test]
+    fn parses_per_track_waveform_property() {
+        let text = "\
+bpm: 120
+steps: 4
+bass.wave: square
+bass: C2 . . .
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(pat.tracks[0].wave, Some(Waveform::Square));
+    }
+
+    #[test]
+    fn property_can_appear_after_track_row() {
+        let text = "\
+bpm: 120
+steps: 4
+bass: C2 . . .
+bass.wave: triangle
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(pat.tracks[0].wave, Some(Waveform::Triangle));
+    }
+
+    #[test]
+    fn waveform_aliases() {
+        for (name, expected) in [
+            ("sine", Waveform::Sine),
+            ("sin", Waveform::Sine),
+            ("square", Waveform::Square),
+            ("sq", Waveform::Square),
+            ("saw", Waveform::Sawtooth),
+            ("sawtooth", Waveform::Sawtooth),
+            ("triangle", Waveform::Triangle),
+            ("tri", Waveform::Triangle),
+            ("SAW", Waveform::Sawtooth),
+        ] {
+            assert_eq!(parse_waveform(name), Some(expected), "for {name}");
+        }
+        assert_eq!(parse_waveform("garbage"), None);
+    }
+
+    #[test]
+    fn errors_on_unknown_property() {
+        let text = "\
+bpm: 120
+steps: 4
+bass.bogus: yes
+bass: C2 . . .
+";
+        match Pattern::parse(text).unwrap_err() {
+            PatternParseError::UnknownProperty { prop, .. } => assert_eq!(prop, "bogus"),
+            other => panic!("expected UnknownProperty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn errors_on_invalid_property_value() {
+        let text = "\
+bpm: 120
+steps: 4
+bass.wave: cosine
+bass: C2 . . .
+";
+        match Pattern::parse(text).unwrap_err() {
+            PatternParseError::InvalidPropertyValue { prop, value, .. } => {
+                assert_eq!(prop, "wave");
+                assert_eq!(value, "cosine");
+            }
+            other => panic!("expected InvalidPropertyValue, got {other:?}"),
+        }
+    }
+
+    // ── slice 5b: chord shorthand ──────────────────────────────────────────
+
+    #[test]
+    fn parses_basic_chord_shorthand() {
+        // C major triad in default octave 3 → C3, E3, G3 = MIDI 48, 52, 55
+        assert_eq!(parse_chord_shorthand("C", 3), Some(vec![48, 52, 55]));
+        // C minor → C, Eb, G
+        assert_eq!(parse_chord_shorthand("Cm", 3), Some(vec![48, 51, 55]));
+        // C dominant 7 → C, E, G, Bb
+        assert_eq!(parse_chord_shorthand("C7", 3), Some(vec![48, 52, 55, 58]));
+        // C major 7 → C, E, G, B
+        assert_eq!(parse_chord_shorthand("Cmaj7", 3), Some(vec![48, 52, 55, 59]));
+        // C minor 7
+        assert_eq!(parse_chord_shorthand("Cm7", 3), Some(vec![48, 51, 55, 58]));
+        // C diminished
+        assert_eq!(parse_chord_shorthand("Cdim", 3), Some(vec![48, 51, 54]));
+        // C augmented
+        assert_eq!(parse_chord_shorthand("Caug", 3), Some(vec![48, 52, 56]));
+        // C sus2 / sus4
+        assert_eq!(parse_chord_shorthand("Csus2", 3), Some(vec![48, 50, 55]));
+        assert_eq!(parse_chord_shorthand("Csus4", 3), Some(vec![48, 53, 55]));
+    }
+
+    #[test]
+    fn chord_shorthand_with_accidentals() {
+        // Eb minor in octave 3: Eb3, Gb3, Bb3 = 51, 54, 58
+        assert_eq!(parse_chord_shorthand("Ebm", 3), Some(vec![51, 54, 58]));
+        // F# major in octave 4: F#4, A#4, C#5 = 66, 70, 73
+        assert_eq!(parse_chord_shorthand("F#", 4), Some(vec![66, 70, 73]));
+    }
+
+    #[test]
+    fn chord_shorthand_rejects_garbage() {
+        assert_eq!(parse_chord_shorthand("Hm", 3), None);
+        assert_eq!(parse_chord_shorthand("Cwhat", 3), None);
+        assert_eq!(parse_chord_shorthand("", 3), None);
+    }
+
+    #[test]
+    fn parses_chord_track() {
+        let text = "\
+bpm: 120
+steps: 8
+pad: Cm . . . Fm . . .
+";
+        let pat = Pattern::parse(text).unwrap();
+        let cells = chords(&pat.tracks[0]);
+        assert_eq!(cells.len(), 8);
+        assert_eq!(cells[0], ChordCell::Chord(vec![48, 51, 55])); // Cm in oct 3
+        assert_eq!(cells[1], ChordCell::Sustain);
+        assert_eq!(cells[4], ChordCell::Chord(vec![53, 56, 60])); // Fm in oct 3
+    }
+
+    #[test]
+    fn chord_track_respects_octave_property() {
+        let text = "\
+bpm: 120
+steps: 4
+pad.octave: 4
+pad: Cm . . .
+";
+        let pat = Pattern::parse(text).unwrap();
+        let cells = chords(&pat.tracks[0]);
+        assert_eq!(cells[0], ChordCell::Chord(vec![60, 63, 67])); // Cm in oct 4
+    }
+
+    #[test]
+    fn chord_octave_property_can_appear_after_row() {
+        // Two-pass parser should pick up the octave even though it's declared
+        // after the track row.
+        let text = "\
+bpm: 120
+steps: 4
+pad: Cm . . .
+pad.octave: 5
+";
+        let pat = Pattern::parse(text).unwrap();
+        let cells = chords(&pat.tracks[0]);
+        assert_eq!(cells[0], ChordCell::Chord(vec![72, 75, 79])); // Cm in oct 5
+    }
+
+    #[test]
+    fn auto_detects_chord_row_from_unambiguous_token() {
+        // Cm is unambiguous → entire row treated as chord row.
+        let text = "\
+bpm: 120
+steps: 4
+prog: Cm Fm G7 Cm
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert!(matches!(pat.tracks[0].kind, TrackKind::Chord(_)));
+    }
+
+    #[test]
+    fn note_row_when_no_chord_marker_present() {
+        // C4, C7 are valid notes; no `m`/`maj`/etc. → note row.
+        let text = "\
+bpm: 120
+steps: 4
+melody: C4 D4 C7 E4
+";
+        let pat = Pattern::parse(text).unwrap();
+        let cells = notes(&pat.tracks[0]);
+        assert_eq!(cells[0], Cell::Note(60));
+        assert_eq!(cells[2], Cell::Note(96)); // C in octave 7, NOT C dom7
     }
 }

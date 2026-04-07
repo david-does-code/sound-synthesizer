@@ -11,7 +11,7 @@ use crossterm::terminal;
 use envelope::AdsrParams;
 use keyboard::{spawn_keyboard_listener, KeyboardEvent};
 use notes::keyboard_help;
-use pattern::{Cell, Pattern, TrackKind};
+use pattern::{Cell, ChordCell, Pattern, TrackKind};
 use sequencer::Sequencer;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -432,10 +432,14 @@ fn play_pattern(path: &str) {
     println!("  Steps: {}", pattern.steps);
     println!("  Tracks:");
     for t in &pattern.tracks {
+        let wave_label = match t.wave {
+            Some(w) => format!(" [{}]", w.name().to_lowercase()),
+            None => String::new(),
+        };
         match &t.kind {
             TrackKind::Drum(hits) => {
                 let visual: String = hits.iter().map(|h| if *h { 'x' } else { '-' }).collect();
-                println!("    🥁 {:<8} {}", t.name, visual);
+                println!("    🥁 {:<8}{wave_label} {}", t.name, visual);
             }
             TrackKind::Notes(cells) => {
                 let visual: String = cells
@@ -446,7 +450,18 @@ fn play_pattern(path: &str) {
                         Cell::Rest => '-',
                     })
                     .collect();
-                println!("    ♪  {:<8} {}", t.name, visual);
+                println!("    ♪  {:<8}{wave_label} {}", t.name, visual);
+            }
+            TrackKind::Chord(cells) => {
+                let visual: String = cells
+                    .iter()
+                    .map(|c| match c {
+                        ChordCell::Chord(_) => 'C',
+                        ChordCell::Sustain => '.',
+                        ChordCell::Rest => '-',
+                    })
+                    .collect();
+                println!("    ♬  {:<8}{wave_label} {}", t.name, visual);
             }
         }
     }
