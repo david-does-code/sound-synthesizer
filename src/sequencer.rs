@@ -56,16 +56,12 @@ enum ResolvedTrack {
     Notes {
         voice_idx: usize,
         cells: Vec<Cell>,
-        /// Gate length as fraction of step (0.0–1.0). `None` = legato (hold
-        /// until next note/rest).
-        gate: Option<f32>,
     },
     /// Chord tracks own `slots` consecutive voices starting at `voice_base`.
     Chord {
         voice_base: usize,
         slots: usize,
         cells: Vec<ChordCell>,
-        gate: Option<f32>,
     },
 }
 
@@ -81,6 +77,10 @@ struct ResolvedSection {
     /// Distinct pitched-voice indices used by this section's note/chord tracks.
     /// Used at section transitions to release voices that drop out.
     voice_set: Vec<usize>,
+    /// Per-voice gate durations in samples for this section (voice_idx → samples).
+    /// Computed from track gate fraction × section samples_per_step. Empty vec
+    /// entries (or absent voices) mean legato.
+    voice_gates: Vec<(usize, u64)>,
 }
 
 /// A voice allocation for one melodic/chord track name.
@@ -152,6 +152,17 @@ impl Sequencer {
                             }
                         }
 
+                        // Set per-voice gate durations for this section.
+                        // First clear all to 0 (legato), then set the ones
+                        // that have gate. This handles tracks that appear
+                        // in one section with gate and another without.
+                        for v in &section.voice_set {
+                            engine.set_voice_gate(*v, 0);
+                        }
+                        for (v, samples) in &section.voice_gates {
+                            engine.set_voice_gate(*v, *samples);
+                        }
+
                         for step in 0..section.steps {
                             if stop.load(Ordering::Relaxed) {
                                 break 'outer;
@@ -168,7 +179,7 @@ impl Sequencer {
                             let target_sample = start_sample + cursor_sample + swing_offset;
 
                             for track in &section.tracks {
-                                dispatch_step(&engine, track, step, target_sample, sps);
+                                dispatch_step(&engine, track, step, target_sample);
                             }
 
                             cursor_sample += sps;
@@ -349,7 +360,6 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                         tracks.push(ResolvedTrack::Notes {
                             voice_idx: va.base,
                             cells: cells.clone(),
-                            gate: track.gate,
                         });
                         push_unique(&mut voice_set, va.base);
                     }
@@ -360,7 +370,6 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                             voice_base: va.base,
                             slots: va.slots,
                             cells: cells.clone(),
-                            gate: track.gate,
                         });
                         for s in 0..va.slots {
                             push_unique(&mut voice_set, va.base + s);
@@ -378,6 +387,19 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
         // Per-section swing: fall back to global.
         let swing = section.swing.unwrap_or(pattern.swing);
 
+        // Compute per-voice gate durations for this section.
+        let mut voice_gates: Vec<(usize, u64)> = Vec::new();
+        for track in &section.tracks {
+            if let Some(g) = track.gate {
+                let gate_samples = (g as f64 * samples_per_step as f64) as u64;
+                if let Some(va) = alloc.get(&track.name) {
+                    for s in 0..va.slots {
+                        voice_gates.push((va.base + s, gate_samples));
+                    }
+                }
+            }
+        }
+
         resolved.push(ResolvedSection {
             name: section.name.clone(),
             steps: section.steps,
@@ -385,6 +407,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
             swing,
             tracks,
             voice_set,
+            voice_gates,
         });
     }
     resolved
@@ -412,7 +435,6 @@ fn dispatch_step(
     track: &ResolvedTrack,
     step: usize,
     target_sample: u64,
-    samples_per_step: u64,
 ) {
     match track {
         ResolvedTrack::Drum { drum, hits } => {
@@ -421,29 +443,21 @@ fn dispatch_step(
                 engine.schedule_drum_at(*drum, target_sample, vel);
             }
         }
-        ResolvedTrack::Notes { voice_idx, cells, gate } => match cells[step] {
+        ResolvedTrack::Notes { voice_idx, cells, .. } => match cells[step] {
             Cell::Note(midi, vel) => {
                 engine.schedule_note_on_vel(*voice_idx, target_sample, midi, vel);
-                if let Some(g) = gate {
-                    let off_at = target_sample + (*g as f64 * samples_per_step as f64) as u64;
-                    engine.schedule_note_off(*voice_idx, off_at);
-                }
             }
             Cell::Rest => {
                 engine.schedule_note_off(*voice_idx, target_sample);
             }
             Cell::Sustain => {}
         },
-        ResolvedTrack::Chord { voice_base, slots, cells, gate } => match &cells[step] {
+        ResolvedTrack::Chord { voice_base, slots, cells, .. } => match &cells[step] {
             ChordCell::Chord(notes) => {
                 for s in 0..*slots {
                     let voice = voice_base + s;
                     if let Some((midi, vel)) = notes.get(s) {
                         engine.schedule_note_on_vel(voice, target_sample, *midi, *vel);
-                        if let Some(g) = gate {
-                            let off_at = target_sample + (*g as f64 * samples_per_step as f64) as u64;
-                            engine.schedule_note_off(voice, off_at);
-                        }
                     } else {
                         engine.schedule_note_off(voice, target_sample);
                     }

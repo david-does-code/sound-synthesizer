@@ -265,6 +265,9 @@ pub struct EngineHandle {
     voice_waveforms: Arc<[AtomicU8; MAX_VOICES]>,
     voice_adsr: Arc<[AtomicU64; MAX_VOICES]>,
     voice_gains: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice gate duration in samples. 0 = legato (no auto-release).
+    /// Read by the callback on each note-on to set a countdown timer.
+    voice_gate: Arc<[AtomicU64; MAX_VOICES]>,
     drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
     sample_clock: Arc<AtomicU64>,
     sample_rate: f32,
@@ -353,6 +356,15 @@ impl EngineHandle {
     pub fn set_drum_gain(&self, drum: Drum, gain: f32) {
         self.drum_gains[drum as usize].store(gain.to_bits(), Ordering::Relaxed);
     }
+
+    /// Set per-voice gate duration in samples. The audio callback will
+    /// auto-release the voice this many samples after each note-on.
+    /// 0 = legato (no auto-release, hold until explicit note-off).
+    pub fn set_voice_gate(&self, voice_idx: usize, samples: u64) {
+        if voice_idx < MAX_VOICES {
+            self.voice_gate[voice_idx].store(samples, Ordering::Relaxed);
+        }
+    }
 }
 
 /// State for a single voice inside the audio callback.
@@ -365,6 +377,9 @@ struct Voice {
     velocity: f32,
     /// Cached packed ADSR to detect changes without unpacking every buffer.
     last_adsr: u64,
+    /// Gate auto-release countdown. When > 0, decrements each sample.
+    /// When it reaches 0, gate_off is triggered. Set from voice_gate on note-on.
+    gate_remaining: u64,
 }
 
 impl Voice {
@@ -376,6 +391,7 @@ impl Voice {
             active: false,
             velocity: 1.0,
             last_adsr: 0,
+            gate_remaining: 0,
         }
     }
 
@@ -433,6 +449,9 @@ pub struct AudioEngine {
     voice_adsr: Arc<[AtomicU64; MAX_VOICES]>,
     /// Per-voice gain multiplier (f32 bits stored as u32). Default 1.0.
     voice_gains: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice gate duration in samples (0 = legato). The callback reads
+    /// this on note-on and sets a countdown to auto-release the voice.
+    voice_gate: Arc<[AtomicU64; MAX_VOICES]>,
     /// Per-drum gain multiplier (f32 bits stored as u32). Default 1.0.
     drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
     /// Per-drum scheduled trigger time (absolute audio sample), 0 = none.
@@ -491,6 +510,12 @@ impl AudioEngine {
             std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
         );
         let voice_gains_clone = voice_gains.clone();
+
+        // Per-voice gate (samples until auto-release, 0 = legato).
+        let voice_gate: Arc<[AtomicU64; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU64::new(0)),
+        );
+        let voice_gate_clone = voice_gate.clone();
 
         // Per-drum gain (f32 bits as u32). Default 1.0.
         let drum_gains: Arc<[AtomicU32; NUM_DRUMS]> = Arc::new(
@@ -620,10 +645,14 @@ impl AudioEngine {
                                     voices[i].velocity = vel;
                                     voices[i].active = true;
                                     voices[i].envelope.gate_on();
+                                    // Read gate duration: 0 = legato (no auto-release).
+                                    voices[i].gate_remaining =
+                                        voice_gate_clone[i].load(Ordering::Relaxed);
                                     active_clone[i].store(true, Ordering::Relaxed);
                                 }
                                 EVENT_RELEASE => {
                                     voices[i].envelope.gate_off();
+                                    voices[i].gate_remaining = 0;
                                 }
                                 _ => {}
                             }
@@ -633,6 +662,14 @@ impl AudioEngine {
                         let mut mix = 0.0_f32;
 
                         for (i, voice) in voices.iter_mut().enumerate() {
+                            // Gate auto-release: countdown per sample.
+                            if voice.gate_remaining > 0 {
+                                voice.gate_remaining -= 1;
+                                if voice.gate_remaining == 0 {
+                                    voice.envelope.gate_off();
+                                }
+                            }
+
                             let was_active = voice.active;
                             mix += voice.next_sample(voice_waves[i]) * vgains[i];
                             // If voice just became inactive, update the shared flag
@@ -677,6 +714,7 @@ impl AudioEngine {
             adsr_packed,
             voice_adsr,
             voice_gains,
+            voice_gate,
             drum_gains,
             drum_schedule,
             voice_events,
@@ -694,6 +732,7 @@ impl AudioEngine {
             voice_waveforms: self.voice_waveforms.clone(),
             voice_adsr: self.voice_adsr.clone(),
             voice_gains: self.voice_gains.clone(),
+            voice_gate: self.voice_gate.clone(),
             drum_gains: self.drum_gains.clone(),
             sample_clock: self.sample_clock.clone(),
             sample_rate: self.sample_rate,
