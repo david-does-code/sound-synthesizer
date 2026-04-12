@@ -109,7 +109,8 @@ fn unpack_cmd(packed: u32) -> (u32, u8) {
 /// Sample-accurate scheduled voice events used by the sequencer.
 ///
 /// Packed into a single AtomicU64 so reads/writes are atomic and ordering-free:
-/// - bits  0..48: target audio sample (u48 — ~9 years at 44.1 kHz)
+/// - bits  0..40: target audio sample (u40 — ~7 hours at 44.1 kHz)
+/// - bits 40..48: velocity (u8, 0–255 mapped to 0.0–1.0)
 /// - bits 48..56: MIDI note (u8)
 /// - bits 56..64: event kind (`EVENT_*` below)
 ///
@@ -118,16 +119,21 @@ const EVENT_NONE: u8 = 0;
 const EVENT_PLAY: u8 = 1;
 const EVENT_RELEASE: u8 = 2;
 
-fn pack_voice_event(kind: u8, target_sample: u64, midi: u8) -> u64 {
-    debug_assert!(target_sample < (1u64 << 48));
-    (target_sample & 0xFFFF_FFFF_FFFF) | ((midi as u64) << 48) | ((kind as u64) << 56)
+fn pack_voice_event(kind: u8, target_sample: u64, midi: u8, velocity: f32) -> u64 {
+    debug_assert!(target_sample < (1u64 << 40));
+    let vel_u8 = (velocity.clamp(0.0, 1.0) * 255.0) as u64;
+    (target_sample & 0xFF_FFFF_FFFF)
+        | (vel_u8 << 40)
+        | ((midi as u64) << 48)
+        | ((kind as u64) << 56)
 }
 
-fn unpack_voice_event(packed: u64) -> (u8, u64, u8) {
-    let target = packed & 0xFFFF_FFFF_FFFF;
+fn unpack_voice_event(packed: u64) -> (u8, u64, u8, f32) {
+    let target = packed & 0xFF_FFFF_FFFF;
+    let vel = ((packed >> 40) & 0xFF) as f32 / 255.0;
     let midi = ((packed >> 48) & 0xFF) as u8;
     let kind = ((packed >> 56) & 0xFF) as u8;
-    (kind, target, midi)
+    (kind, target, midi, vel)
 }
 
 /// State for a single drum voice inside the audio callback.
@@ -148,6 +154,8 @@ struct DrumVoice {
     phase: f32,
     /// xorshift32 state for noise generation.
     rng: u32,
+    /// Velocity of the current hit (0.0–1.0).
+    velocity: f32,
 }
 
 impl DrumVoice {
@@ -158,12 +166,19 @@ impl DrumVoice {
             sample_idx: u32::MAX,
             phase: 0.0,
             rng: seed,
+            velocity: 1.0,
         }
     }
 
-    fn trigger(&mut self) {
+    fn trigger_with_velocity(&mut self, vel: f32) {
         self.sample_idx = 0;
         self.phase = 0.0;
+        self.velocity = vel;
+    }
+
+    #[allow(dead_code)]
+    fn trigger(&mut self) {
+        self.trigger_with_velocity(1.0);
     }
 
     fn noise(&mut self) -> f32 {
@@ -224,7 +239,7 @@ impl DrumVoice {
         }
 
         self.sample_idx = self.sample_idx.saturating_add(1);
-        signal * amp
+        signal * amp * self.velocity
     }
 }
 
@@ -248,6 +263,9 @@ pub struct EngineHandle {
     drum_schedule: Arc<[AtomicU64; NUM_DRUMS]>,
     voice_events: Arc<[AtomicU64; MAX_VOICES]>,
     voice_waveforms: Arc<[AtomicU8; MAX_VOICES]>,
+    voice_adsr: Arc<[AtomicU64; MAX_VOICES]>,
+    voice_gains: Arc<[AtomicU32; MAX_VOICES]>,
+    drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
     sample_clock: Arc<AtomicU64>,
     sample_rate: f32,
 }
@@ -264,9 +282,18 @@ impl EngineHandle {
     }
 
     /// Schedule a drum to fire at the given absolute audio sample number.
+    /// Velocity defaults to 1.0.
+    #[allow(dead_code)]
     pub fn schedule_at(&self, drum: Drum, target_sample: u64) {
-        // 0 means "nothing scheduled", so clamp to ≥1.
-        self.drum_schedule[drum as usize].store(target_sample.max(1), Ordering::Relaxed);
+        self.schedule_drum_at(drum, target_sample, 1.0);
+    }
+
+    /// Schedule a drum with a specific velocity (0.0–1.0).
+    pub fn schedule_drum_at(&self, drum: Drum, target_sample: u64, velocity: f32) {
+        // Pack: bits 0..48 = target sample, bits 48..64 = velocity as u16.
+        let vel_u16 = (velocity.clamp(0.0, 1.0) * 65535.0) as u64;
+        let packed = (target_sample.max(1) & 0xFFFF_FFFF_FFFF) | (vel_u16 << 48);
+        self.drum_schedule[drum as usize].store(packed, Ordering::Relaxed);
     }
 
     /// Trigger a drum as soon as possible (used for live, non-sequenced playback).
@@ -276,10 +303,16 @@ impl EngineHandle {
     }
 
     /// Schedule a note-on (gate-on with new pitch) for `voice_idx` at the given
-    /// absolute audio sample. Retriggers the voice if it was already playing.
+    /// absolute audio sample. Velocity defaults to 1.0.
+    #[allow(dead_code)]
     pub fn schedule_note_on(&self, voice_idx: usize, target_sample: u64, midi: u8) {
+        self.schedule_note_on_vel(voice_idx, target_sample, midi, 1.0);
+    }
+
+    /// Schedule a note-on with explicit velocity (0.0–1.0).
+    pub fn schedule_note_on_vel(&self, voice_idx: usize, target_sample: u64, midi: u8, velocity: f32) {
         if voice_idx < MAX_VOICES {
-            let packed = pack_voice_event(EVENT_PLAY, target_sample, midi);
+            let packed = pack_voice_event(EVENT_PLAY, target_sample, midi, velocity);
             self.voice_events[voice_idx].store(packed, Ordering::Relaxed);
         }
     }
@@ -288,7 +321,7 @@ impl EngineHandle {
     /// at the given absolute audio sample.
     pub fn schedule_note_off(&self, voice_idx: usize, target_sample: u64) {
         if voice_idx < MAX_VOICES {
-            let packed = pack_voice_event(EVENT_RELEASE, target_sample, 0);
+            let packed = pack_voice_event(EVENT_RELEASE, target_sample, 0, 0.0);
             self.voice_events[voice_idx].store(packed, Ordering::Relaxed);
         }
     }
@@ -300,6 +333,26 @@ impl EngineHandle {
             self.voice_waveforms[voice_idx].store(waveform as u8, Ordering::Relaxed);
         }
     }
+
+    /// Set per-voice ADSR parameters. Used by the sequencer so each track can
+    /// have its own envelope shape.
+    pub fn set_voice_adsr(&self, voice_idx: usize, params: AdsrParams) {
+        if voice_idx < MAX_VOICES {
+            self.voice_adsr[voice_idx].store(pack_adsr(&params), Ordering::Relaxed);
+        }
+    }
+
+    /// Set per-voice gain (0.0–∞, typically 0.0–2.0). Default is 1.0.
+    pub fn set_voice_gain(&self, voice_idx: usize, gain: f32) {
+        if voice_idx < MAX_VOICES {
+            self.voice_gains[voice_idx].store(gain.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Set per-drum gain (0.0–∞, typically 0.0–2.0). Default is 1.0.
+    pub fn set_drum_gain(&self, drum: Drum, gain: f32) {
+        self.drum_gains[drum as usize].store(gain.to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// State for a single voice inside the audio callback.
@@ -308,6 +361,10 @@ struct Voice {
     phase: f32,
     envelope: Envelope,
     active: bool,
+    /// Per-note velocity (0.0–1.0), set on note-on.
+    velocity: f32,
+    /// Cached packed ADSR to detect changes without unpacking every buffer.
+    last_adsr: u64,
 }
 
 impl Voice {
@@ -317,6 +374,8 @@ impl Voice {
             phase: 0.0,
             envelope: Envelope::new(sample_rate),
             active: false,
+            velocity: 1.0,
+            last_adsr: 0,
         }
     }
 
@@ -332,7 +391,7 @@ impl Voice {
             return 0.0;
         }
 
-        let value = waveform.sample(self.phase) * env_amp;
+        let value = waveform.sample(self.phase) * env_amp * self.velocity;
 
         self.phase += self.frequency / self.envelope.sample_rate();
         if self.phase >= 1.0 {
@@ -369,6 +428,13 @@ pub struct AudioEngine {
     /// The audio callback reads from here, not from the global `waveform`.
     voice_waveforms: Arc<[AtomicU8; MAX_VOICES]>,
     adsr_packed: Arc<AtomicU64>,
+    /// Per-voice ADSR params — lets the sequencer give each track its own
+    /// envelope shape. 0 = use global ADSR.
+    voice_adsr: Arc<[AtomicU64; MAX_VOICES]>,
+    /// Per-voice gain multiplier (f32 bits stored as u32). Default 1.0.
+    voice_gains: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-drum gain multiplier (f32 bits stored as u32). Default 1.0.
+    drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
     /// Per-drum scheduled trigger time (absolute audio sample), 0 = none.
     drum_schedule: Arc<[AtomicU64; NUM_DRUMS]>,
     /// Per-voice scheduled events (packed: kind | midi | sample), 0 = none.
@@ -414,6 +480,24 @@ impl AudioEngine {
         let adsr_packed = Arc::new(AtomicU64::new(pack_adsr(&default_params)));
         let adsr_clone = adsr_packed.clone();
 
+        // Per-voice ADSR: 0 means "use global ADSR".
+        let voice_adsr: Arc<[AtomicU64; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU64::new(0)),
+        );
+        let voice_adsr_clone = voice_adsr.clone();
+
+        // Per-voice gain (f32 bits as u32). Default 1.0.
+        let voice_gains: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
+        );
+        let voice_gains_clone = voice_gains.clone();
+
+        // Per-drum gain (f32 bits as u32). Default 1.0.
+        let drum_gains: Arc<[AtomicU32; NUM_DRUMS]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
+        );
+        let drum_gains_clone = drum_gains.clone();
+
         let mut voices: Vec<Voice> = (0..MAX_VOICES)
             .map(|_| Voice::new(sample_rate))
             .collect();
@@ -448,14 +532,30 @@ impl AudioEngine {
                         Waveform::from_u8(voice_waveforms_clone[i].load(Ordering::Relaxed))
                     });
 
-                    // Update ADSR params if changed
+                    // Snapshot per-voice gains once per buffer.
+                    let vgains: [f32; MAX_VOICES] = std::array::from_fn(|i| {
+                        f32::from_bits(voice_gains_clone[i].load(Ordering::Relaxed))
+                    });
+                    let dgains: [f32; NUM_DRUMS] = std::array::from_fn(|i| {
+                        f32::from_bits(drum_gains_clone[i].load(Ordering::Relaxed))
+                    });
+
+                    // Update ADSR params if changed — global ADSR applies to
+                    // voices that don't have a per-voice override (slot == 0).
                     let current_adsr = adsr_clone.load(Ordering::Relaxed);
-                    if current_adsr != prev_adsr_packed {
-                        let params = unpack_adsr(current_adsr);
-                        for voice in voices.iter_mut() {
-                            voice.envelope.set_params(params);
-                        }
+                    let global_changed = current_adsr != prev_adsr_packed;
+                    if global_changed {
                         prev_adsr_packed = current_adsr;
+                    }
+                    // Per-voice ADSR: snapshot and apply. A per-voice value of
+                    // 0 means "use global".
+                    for (i, voice) in voices.iter_mut().enumerate() {
+                        let per_voice = voice_adsr_clone[i].load(Ordering::Relaxed);
+                        let effective = if per_voice != 0 { per_voice } else { current_adsr };
+                        if voice.last_adsr != effective {
+                            voice.envelope.set_params(unpack_adsr(effective));
+                            voice.last_adsr = effective;
+                        }
                     }
 
                     // Process commands from the main thread
@@ -488,10 +588,16 @@ impl AudioEngine {
                     for frame in data.chunks_mut(channels) {
                         // Sample-accurate drum scheduling: fire any drum whose
                         // scheduled sample has arrived. Cleared after firing.
+                        // Packed: bits 0..48 = target sample, bits 48..64 = velocity u16.
                         for (i, slot) in drum_schedule_clone.iter().enumerate() {
-                            let target = slot.load(Ordering::Relaxed);
-                            if target != 0 && local_clock >= target {
-                                drum_voices[i].trigger();
+                            let packed = slot.load(Ordering::Relaxed);
+                            if packed == 0 {
+                                continue;
+                            }
+                            let target = packed & 0xFFFF_FFFF_FFFF;
+                            if local_clock >= target {
+                                let vel = ((packed >> 48) & 0xFFFF) as f32 / 65535.0;
+                                drum_voices[i].trigger_with_velocity(vel);
                                 slot.store(0, Ordering::Relaxed);
                             }
                         }
@@ -503,7 +609,7 @@ impl AudioEngine {
                             if packed == 0 {
                                 continue;
                             }
-                            let (kind, target, midi) = unpack_voice_event(packed);
+                            let (kind, target, midi, vel) = unpack_voice_event(packed);
                             if kind == EVENT_NONE || local_clock < target {
                                 continue;
                             }
@@ -511,6 +617,7 @@ impl AudioEngine {
                                 EVENT_PLAY => {
                                     voices[i].frequency = midi_to_freq(midi);
                                     voices[i].phase = 0.0;
+                                    voices[i].velocity = vel;
                                     voices[i].active = true;
                                     voices[i].envelope.gate_on();
                                     active_clone[i].store(true, Ordering::Relaxed);
@@ -527,7 +634,7 @@ impl AudioEngine {
 
                         for (i, voice) in voices.iter_mut().enumerate() {
                             let was_active = voice.active;
-                            mix += voice.next_sample(voice_waves[i]);
+                            mix += voice.next_sample(voice_waves[i]) * vgains[i];
                             // If voice just became inactive, update the shared flag
                             if was_active && !voice.active {
                                 active_clone[i].store(false, Ordering::Relaxed);
@@ -537,11 +644,10 @@ impl AudioEngine {
                         // Pitched voices: scale to prevent clipping.
                         let mut value = mix * 0.4 / (MAX_VOICES as f32).sqrt();
 
-                        // Mix in drums at a slightly hotter level — they're short and
-                        // benefit from being prominent in the mix.
+                        // Mix in drums with per-drum gain.
                         let mut drum_mix = 0.0_f32;
-                        for dv in drum_voices.iter_mut() {
-                            drum_mix += dv.next_sample();
+                        for (i, dv) in drum_voices.iter_mut().enumerate() {
+                            drum_mix += dv.next_sample() * dgains[i];
                         }
                         value += drum_mix * 0.5;
 
@@ -569,6 +675,9 @@ impl AudioEngine {
             waveform,
             voice_waveforms,
             adsr_packed,
+            voice_adsr,
+            voice_gains,
+            drum_gains,
             drum_schedule,
             voice_events,
             sample_clock,
@@ -583,6 +692,9 @@ impl AudioEngine {
             drum_schedule: self.drum_schedule.clone(),
             voice_events: self.voice_events.clone(),
             voice_waveforms: self.voice_waveforms.clone(),
+            voice_adsr: self.voice_adsr.clone(),
+            voice_gains: self.voice_gains.clone(),
+            drum_gains: self.drum_gains.clone(),
             sample_clock: self.sample_clock.clone(),
             sample_rate: self.sample_rate,
         }

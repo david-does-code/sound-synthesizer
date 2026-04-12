@@ -12,33 +12,37 @@ See PLAN.md for the roadmap and current progress.
   `voice_commands` (`[AtomicU32; 8]` for immediate piano play/release), `voice_active`
   (`[AtomicBool; 8]`), global `waveform` (`AtomicU8`, used by piano mode + as a default),
   per-voice `voice_waveforms` (`[AtomicU8; 8]`, lets each track have its own timbre,
-  read by the audio callback), ADSR params (packed `AtomicU64`), `drum_schedule`
-  (`[AtomicU64; 3]` holding absolute audio sample numbers for sample-accurate drum
-  triggers), `voice_events` (`[AtomicU64; 8]` packed (kind, midi, sample) for
-  sample-accurate note scheduling by the sequencer), and `sample_clock` (`AtomicU64`,
-  advanced per-frame by the callback). Contains `Waveform`, `Drum`, `DrumVoice`, and
-  `EngineHandle` — a clonable Send + Sync control surface used by the sequencer to
-  schedule drums + pitched notes and to set per-voice waveforms.
+  read by the audio callback), global ADSR params (packed `AtomicU64`) plus per-voice
+  ADSR (`voice_adsr: [AtomicU64; 8]`, 0 = use global), per-voice gain
+  (`voice_gains: [AtomicU32; 8]`, f32 bits as u32, default 1.0), per-drum gain
+  (`drum_gains: [AtomicU32; 3]`), `drum_schedule` (`[AtomicU64; 3]` packed
+  target-sample + velocity for sample-accurate drum triggers), `voice_events`
+  (`[AtomicU64; 8]` packed (kind, velocity, midi, sample) for sample-accurate note
+  scheduling), and `sample_clock` (`AtomicU64`, advanced per-frame by the callback).
+  Each voice and drum carries a velocity field set on trigger. Contains `Waveform`,
+  `Drum`, `DrumVoice`, and `EngineHandle` — a clonable Send + Sync control surface
+  used by the sequencer to schedule drums + pitched notes and to set per-voice
+  waveforms, ADSR, and gain.
 - `src/envelope.rs` — ADSR envelope generator. Per-sample state machine (Idle → Attack →
   Decay → Sustain → Release → Idle). Lives inside the audio callback closure.
 - `src/keyboard.rs` — Reads raw keyboard events from Linux evdev (`/dev/input/`).
   Sends note, waveform, octave, mode toggle, and arrow key events over an MPSC channel.
 - `src/pattern.rs` — Pattern file format and parser. Defines `Pattern` (with `bpm`,
-  `sections: Vec<Section>`, `song: Vec<SongEntry>`), `Section` (with `name`, `steps`,
-  `tracks`), `Track` (with optional `wave` property), `TrackKind` (`Drum(Vec<bool>)` /
-  `Notes(Vec<Cell>)` / `Chord(Vec<ChordCell>)`), `Cell` and `ChordCell` (each:
-  `Rest | Sustain | Note(...)`), and `PatternParseError`. Format: `bpm:`/`steps:`
-  global headers, then optional `[section]` headers introducing named sections, track
-  rows, per-track property lines (`name.wave: square`, `name.octave: 4`), and an
-  optional `song: intro verse x2 chorus outro` chain. Files with no `[section]`
-  headers become an implicit single `"main"` section with an implicit song. Two-pass
-  parser: pass 1 collects properties globally, pass 2 builds sections/tracks/song.
-  Per-section `steps:` overrides the global default. Auto-detects per row: drum rows
-  contain only `xX-./whitespace`; chord rows contain at least one unambiguous chord
-  token like `Cm`/`Gmaj7`/`Fdim`; everything else is a note row. `parse_note_name`
-  handles scientific pitch notation (middle C = C4 = MIDI 60); `parse_chord_shorthand`
-  handles major/minor/7/maj7/m7/dim/dim7/aug/sus2/sus4 with sharps and flats. Comments
-  with `#` are line-only (must start at line start) so `F#4` parses as F-sharp 4.
+  `swing`, `sections: Vec<Section>`, `song: Vec<SongEntry>`), `Section` (with `name`,
+  `steps`, optional `bpm`/`swing` overrides, `tracks`), `Track` (with optional `wave`,
+  `attack`/`decay`/`sustain`/`release`, `gain`, `gate` properties), `TrackKind`
+  (`Drum(Vec<f32>)` velocities / `Notes(Vec<Cell>)` / `Chord(Vec<ChordCell>)`), `Cell`
+  (`Rest | Sustain | Note(u8, f32)` with velocity) and `ChordCell` (`Rest | Sustain |
+  Chord(Vec<(u8, f32)>)`), and `PatternParseError`. Format: `bpm:`/`steps:`/`swing:`
+  global headers, then optional `[section]` headers (with per-section `bpm:`/`swing:`),
+  track rows, per-track property lines (`name.wave: square`, `name.attack: 200ms`,
+  `name.gain: 1.5`, `name.gate: 0.5`, `name.octave: 4`), and an optional
+  `song: intro verse x2 chorus outro` chain. Velocity: drums use `X` (accent 1.0),
+  `x` (normal 0.7), `o` (ghost 0.35); notes use `C4!` (accent) / `C4?` (ghost).
+  Time values accept seconds (`0.2`) or milliseconds (`200ms`). Two-pass parser:
+  pass 1 collects properties globally, pass 2 builds sections/tracks/song. Auto-detects
+  per row: drum rows contain only `xXo-./whitespace`; chord rows contain at least one
+  unambiguous chord token; everything else is a note row.
 - `src/sequencer.rs` — Step sequencer that plays a `Pattern` via a background thread.
   Uses sample-accurate scheduling via `EngineHandle`: pre-computes the absolute audio
   sample for each step and writes it to per-drum/per-voice atomic slots, so playback
@@ -46,19 +50,21 @@ See PLAN.md for the roadmap and current progress.
   global across all sections** — `pre_resolve` walks every section and assigns each
   unique pitched/chord track name a stable voice slot, so a `bass` line that appears
   in both verse and chorus shares one voice slot and its envelope state carries cleanly
-  across the section boundary. The play loop walks the song chain, repeating each
-  section the specified number of times, then loops the whole song forever. At section
-  transitions, voices owned by tracks that don't appear in the new section get released
-  so notes don't drone forever after their track drops out. Per-track waveform is
-  applied via `set_voice_waveform` once at startup. Releases all owned voices on stop.
-  Lookahead is ~100 ms.
+  across the section boundary. Pre-resolve also applies per-track waveform, ADSR, and
+  gain to the engine once at startup, and computes per-section `samples_per_step` from
+  each section's BPM (falling back to global). The play loop walks the song chain with
+  per-section timing, applies swing offset to odd steps, dispatches velocity-aware
+  note-on/drum events, and schedules automatic note-offs when gate < 1.0. At section
+  transitions, voices owned by tracks that don't appear in the new section get released.
+  Releases all owned voices on stop. Lookahead is ~100 ms.
 - `src/main.rs` — Two interactive modes (piano + ADSR editor, Tab toggles) plus a CLI
   pattern player: `cargo run -- --play <file.pat>` loads a pattern and plays it in a
   loop until Enter is pressed. `--help` lists usage.
 - `src/visualizer.rs` — Renders waveforms and ADSR envelopes using Unicode braille characters
   (2×4 dot grid per character). Shared `render_braille` function for both.
 - `src/notes.rs` — Keyboard layout diagram.
-- `patterns/` — Example `.pat` files (`four_on_the_floor.pat` and diagnostic patterns).
+- `patterns/` — Example `.pat` files (`four_on_the_floor.pat`, `cm_expressive.pat` which
+  demos all 5d-5i features, and other diagnostic/demo patterns).
 
 ## Key Design Decisions
 
@@ -76,8 +82,9 @@ See PLAN.md for the roadmap and current progress.
   When all 8 voices are busy, voice 0 is stolen.
 - **ADSR via packed AtomicU64**: Four f32 params are quantized to u16 and packed into a
   single u64 for atomic transfer. Each voice has its own envelope state machine.
-- **Gain staging**: Voices are summed and scaled by `0.4 / √8` to prevent clipping.
-  Drums are mixed in separately at 0.5 gain on top of the pitched voices.
+- **Gain staging**: Voices are summed (each multiplied by its per-voice gain) and
+  scaled by `0.4 / √8` to prevent clipping. Drums are mixed in separately at 0.5 gain
+  (each multiplied by its per-drum gain) on top of the pitched voices.
 - **Drum synthesis recipes**: Each drum is a tiny formula run per sample. Kick = pitch-swept
   sine (150 Hz → 40 Hz, exp decay). Snare = white noise + 180 Hz body tone. HiHat = fast-
   decaying noise. Each voice deactivates only once amplitude falls below 0.001 (no hard
@@ -111,5 +118,7 @@ See PLAN.md for the roadmap and current progress.
 Check PLAN.md — Phases 1-4 are complete. Phase 5 (sequencer + composition) is in
 progress. Done: parser, drum synthesis, sequencer engine, sample-accurate timing,
 melodic note tracks, per-track instruments (5a), chord shorthand (5b), song
-structure with sections + song chains (5c). Next up: per-track ADSR (5d), then
-mix / dynamics / gate / swing / tempo changes, then TUI grid view + editor.
+structure with sections + song chains (5c), per-track ADSR (5d), per-track
+volume/mixing (5e), velocity/dynamics (5f), note gate length (5g), swing/shuffle
+(5h), per-section BPM (5i). Next up: TUI grid view + editor (5j-5k), then
+WAV export (5l).

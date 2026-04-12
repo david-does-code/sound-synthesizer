@@ -89,6 +89,8 @@ const DEFAULT_CHORD_OCTAVE: i32 = 3;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub bpm: u32,
+    /// Global swing amount (0.0–1.0). 0.0 = straight, 0.5 = full triplet feel.
+    pub swing: f32,
     pub sections: Vec<Section>,
     pub song: Vec<SongEntry>,
 }
@@ -98,6 +100,10 @@ pub struct Pattern {
 pub struct Section {
     pub name: String,
     pub steps: usize,
+    /// Per-section BPM override. `None` = inherit from global `Pattern.bpm`.
+    pub bpm: Option<u32>,
+    /// Per-section swing override. `None` = inherit from global `Pattern.swing`.
+    pub swing: Option<f32>,
     pub tracks: Vec<Track>,
 }
 
@@ -122,13 +128,23 @@ pub struct Track {
     pub kind: TrackKind,
     /// Optional per-track waveform override (`name.wave: square`).
     pub wave: Option<Waveform>,
+    /// Per-track ADSR overrides (`name.attack: 0.2`, etc.). `None` = use default.
+    pub attack: Option<f32>,
+    pub decay: Option<f32>,
+    pub sustain: Option<f32>,
+    pub release: Option<f32>,
+    /// Per-track gain/volume (`name.gain: 0.8`). `None` = use default (1.0).
+    pub gain: Option<f32>,
+    /// Per-track gate length as fraction of step (`name.gate: 0.5`). `None` = legato.
+    pub gate: Option<f32>,
 }
 
 /// What this track plays.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrackKind {
-    /// Drum-style track. `hits[i] == true` means trigger the drum at step `i`.
-    Drum(Vec<bool>),
+    /// Drum-style track. Each step is a velocity (0.0 = rest, >0 = hit).
+    /// `X` = accent (1.0), `x` = normal (0.7), `o` = ghost (0.35).
+    Drum(Vec<f32>),
     /// Monophonic note track. One [`Cell`] per step.
     Notes(Vec<Cell>),
     /// Polyphonic chord track. One [`ChordCell`] per step. Each chord plays
@@ -136,26 +152,33 @@ pub enum TrackKind {
     Chord(Vec<ChordCell>),
 }
 
+/// Default velocity for normal hits.
+pub const VEL_NORMAL: f32 = 0.7;
+/// Velocity for accented hits.
+pub const VEL_ACCENT: f32 = 1.0;
+/// Velocity for ghost notes.
+pub const VEL_GHOST: f32 = 0.35;
+
 /// One cell of a monophonic note track.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Cell {
     /// Release any held note and stay silent.
     Rest,
     /// Continue holding whatever note is currently playing.
     Sustain,
-    /// Trigger the given MIDI note (releasing any previous one on this track).
-    Note(u8),
+    /// Trigger the given MIDI note with velocity (0.0–1.0).
+    Note(u8, f32),
 }
 
 /// One cell of a polyphonic chord track.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChordCell {
     /// Release any held notes and stay silent.
     Rest,
     /// Continue holding whatever chord is currently playing.
     Sustain,
-    /// Trigger the given set of MIDI notes simultaneously.
-    Chord(Vec<u8>),
+    /// Trigger the given set of (MIDI note, velocity) pairs simultaneously.
+    Chord(Vec<(u8, f32)>),
 }
 
 /// Errors that can occur while parsing a pattern file.
@@ -233,7 +256,7 @@ impl fmt::Display for PatternParseError {
             ),
             Self::UnknownProperty { line, track, prop } => write!(
                 f,
-                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave)"
+                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave, attack, decay, sustain, release, gain, gate)"
             ),
             Self::InvalidPropertyValue { line, track, prop, value } => write!(
                 f,
@@ -299,6 +322,7 @@ impl Pattern {
         // ── pass 2: parse headers, sections, and the song chain ────────────
         let mut bpm: Option<u32> = None;
         let mut global_steps: Option<usize> = None;
+        let mut global_swing: f32 = 0.0;
         let mut sections: Vec<Section> = Vec::new();
         let mut song: Vec<SongEntry> = Vec::new();
 
@@ -324,6 +348,8 @@ impl Pattern {
                 current = Some(Section {
                     name: name.to_string(),
                     steps: global_steps.unwrap_or(0),
+                    bpm: None,
+                    swing: None,
                     tracks: Vec::new(),
                 });
                 implicit_section = false;
@@ -355,7 +381,16 @@ impl Pattern {
 
             match key {
                 "bpm" => {
-                    bpm = Some(parse_header_num(line_no, key, value)?);
+                    let val: u32 = parse_header_num(line_no, key, value)?;
+                    if bpm.is_none() || implicit_section {
+                        bpm = Some(val);
+                    }
+                    // If we're inside a named section, also set per-section BPM.
+                    if !implicit_section {
+                        if let Some(ref mut sec) = current {
+                            sec.bpm = Some(val);
+                        }
+                    }
                 }
                 "steps" => {
                     let n: usize = parse_header_num(line_no, key, value)?;
@@ -368,6 +403,24 @@ impl Pattern {
                         global_steps = Some(n);
                     }
                 }
+                "swing" => {
+                    let s: f32 = value.parse().map_err(|_| {
+                        PatternParseError::InvalidHeaderValue {
+                            line: line_no,
+                            key: key.to_string(),
+                            value: value.to_string(),
+                        }
+                    })?;
+                    let clamped = s.clamp(0.0, 1.0);
+                    if implicit_section || !current.is_some() {
+                        global_swing = clamped;
+                    }
+                    if let Some(ref mut sec) = current {
+                        if !implicit_section {
+                            sec.swing = Some(clamped);
+                        }
+                    }
+                }
                 "song" => {
                     song = parse_song_chain(line_no, value)?;
                 }
@@ -377,6 +430,8 @@ impl Pattern {
                         current = Some(Section {
                             name: "main".to_string(),
                             steps: global_steps.unwrap_or(0),
+                            bpm: None,
+                            swing: None,
                             tracks: Vec::new(),
                         });
                     }
@@ -403,6 +458,12 @@ impl Pattern {
                         name: key.to_string(),
                         kind,
                         wave: track_props.wave,
+                        attack: track_props.attack,
+                        decay: track_props.decay,
+                        sustain: track_props.sustain,
+                        release: track_props.release,
+                        gain: track_props.gain,
+                        gate: track_props.gate,
                     });
                 }
             }
@@ -437,6 +498,7 @@ impl Pattern {
 
         Ok(Pattern {
             bpm: bpm.ok_or(PatternParseError::MissingHeader("bpm"))?,
+            swing: global_swing,
             sections,
             song,
         })
@@ -492,6 +554,12 @@ fn parse_song_chain(line_no: usize, value: &str) -> Result<Vec<SongEntry>, Patte
 struct TrackProps {
     wave: Option<Waveform>,
     octave: Option<i32>,
+    attack: Option<f32>,
+    decay: Option<f32>,
+    sustain: Option<f32>,
+    release: Option<f32>,
+    gain: Option<f32>,
+    gate: Option<f32>,
 }
 
 fn apply_property(
@@ -524,6 +592,54 @@ fn apply_property(
             })?;
             out.octave = Some(oct);
         }
+        "attack" | "decay" | "release" => {
+            let secs = parse_time_value(value).ok_or_else(|| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            match prop {
+                "attack" => out.attack = Some(secs),
+                "decay" => out.decay = Some(secs),
+                _ => out.release = Some(secs),
+            }
+        }
+        "sustain" => {
+            let level: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.sustain = Some(level.clamp(0.0, 1.0));
+        }
+        "gain" => {
+            let g: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.gain = Some(g.max(0.0));
+        }
+        "gate" => {
+            let g: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.gate = Some(g.clamp(0.0, 1.0));
+        }
         _ => {
             return Err(PatternParseError::UnknownProperty {
                 line: line_no,
@@ -533,6 +649,17 @@ fn apply_property(
         }
     }
     Ok(())
+}
+
+/// Parse a time value: bare number is seconds (`0.2`), suffix `ms` is
+/// milliseconds (`200ms`). Returns seconds.
+fn parse_time_value(s: &str) -> Option<f32> {
+    if let Some(ms_str) = s.strip_suffix("ms") {
+        let ms: f32 = ms_str.trim().parse().ok()?;
+        Some(ms / 1000.0)
+    } else {
+        s.parse::<f32>().ok()
+    }
 }
 
 /// Parse a waveform name (case-insensitive). Accepts `sine`, `square`,
@@ -573,24 +700,26 @@ fn parse_header_num<T: std::str::FromStr>(
 }
 
 /// A track value is a "drum track" if every non-whitespace character is one of
-/// `xX-.`. Anything else (digits, letters other than x/X) means it's a note row.
+/// `xXo-.`. Anything else (digits, letters other than x/X/o) means it's a note row.
 fn looks_like_drum_track(value: &str) -> bool {
     value
         .chars()
         .filter(|c| !c.is_whitespace())
-        .all(|c| matches!(c, 'x' | 'X' | '-' | '.'))
+        .all(|c| matches!(c, 'x' | 'X' | 'o' | '-' | '.'))
 }
 
 fn parse_drum_row(
     line_no: usize,
     value: &str,
     expected: usize,
-) -> Result<Vec<bool>, PatternParseError> {
+) -> Result<Vec<f32>, PatternParseError> {
     let mut hits = Vec::with_capacity(expected);
     for ch in value.chars() {
         match ch {
-            'x' | 'X' => hits.push(true),
-            '-' | '.' => hits.push(false),
+            'X' => hits.push(VEL_ACCENT),
+            'x' => hits.push(VEL_NORMAL),
+            'o' => hits.push(VEL_GHOST),
+            '-' | '.' => hits.push(0.0),
             c if c.is_whitespace() => continue,
             other => {
                 return Err(PatternParseError::InvalidStepChar {
@@ -621,15 +750,25 @@ fn parse_note_row(
         let cell = match token {
             "-" => Cell::Rest,
             "." => Cell::Sustain,
-            other => match parse_note_name(other) {
-                Some(midi) => Cell::Note(midi),
-                None => {
-                    return Err(PatternParseError::InvalidNoteToken {
-                        line: line_no,
-                        token: other.to_string(),
-                    });
+            other => {
+                // Strip velocity suffix: `!` = accent, `?` = ghost.
+                let (note_str, vel) = if let Some(s) = other.strip_suffix('!') {
+                    (s, VEL_ACCENT)
+                } else if let Some(s) = other.strip_suffix('?') {
+                    (s, VEL_GHOST)
+                } else {
+                    (other, VEL_NORMAL)
+                };
+                match parse_note_name(note_str) {
+                    Some(midi) => Cell::Note(midi, vel),
+                    None => {
+                        return Err(PatternParseError::InvalidNoteToken {
+                            line: line_no,
+                            token: other.to_string(),
+                        });
+                    }
                 }
-            },
+            }
         };
         cells.push(cell);
     }
@@ -678,15 +817,26 @@ fn parse_chord_row(
         let cell = match token {
             "-" => ChordCell::Rest,
             "." => ChordCell::Sustain,
-            other => match parse_chord_shorthand(other, octave) {
-                Some(notes) => ChordCell::Chord(notes),
-                None => {
-                    return Err(PatternParseError::InvalidNoteToken {
-                        line: line_no,
-                        token: other.to_string(),
-                    });
+            other => {
+                let (chord_str, vel) = if let Some(s) = other.strip_suffix('!') {
+                    (s, VEL_ACCENT)
+                } else if let Some(s) = other.strip_suffix('?') {
+                    (s, VEL_GHOST)
+                } else {
+                    (other, VEL_NORMAL)
+                };
+                match parse_chord_shorthand(chord_str, octave) {
+                    Some(notes) => {
+                        ChordCell::Chord(notes.into_iter().map(|m| (m, vel)).collect())
+                    }
+                    None => {
+                        return Err(PatternParseError::InvalidNoteToken {
+                            line: line_no,
+                            token: other.to_string(),
+                        });
+                    }
                 }
-            },
+            }
         };
         cells.push(cell);
     }
@@ -819,9 +969,9 @@ pub fn parse_note_name(s: &str) -> Option<u8> {
 mod tests {
     use super::*;
 
-    fn drum_hits(track: &Track) -> &Vec<bool> {
+    fn drum_hits(track: &Track) -> Vec<bool> {
         match &track.kind {
-            TrackKind::Drum(h) => h,
+            TrackKind::Drum(h) => h.iter().map(|v| *v > 0.0).collect(),
             _ => panic!("expected drum track, got {:?}", track.kind),
         }
     }
@@ -831,6 +981,16 @@ mod tests {
             TrackKind::Notes(c) => c,
             _ => panic!("expected note track, got {:?}", track.kind),
         }
+    }
+
+    /// Shorthand for Cell::Note with default velocity.
+    fn note(midi: u8) -> Cell {
+        Cell::Note(midi, VEL_NORMAL)
+    }
+
+    /// Shorthand for ChordCell::Chord with default velocity.
+    fn chord(midis: &[u8]) -> ChordCell {
+        ChordCell::Chord(midis.iter().map(|m| (*m, VEL_NORMAL)).collect())
     }
 
     fn chords(track: &Track) -> &Vec<ChordCell> {
@@ -859,7 +1019,7 @@ hihat:   x-x-x-x-x-x-x-x-
         let kick = drum_hits(&pat.sections[0].tracks[0]);
         assert_eq!(
             kick,
-            &vec![
+            vec![
                 true, false, false, false, true, false, false, false, true, false, false, false,
                 true, false, false, false,
             ]
@@ -883,11 +1043,11 @@ bass: C2 . . . Eb2 . . .
         let pat = Pattern::parse(text).unwrap();
         let cells = notes(&pat.sections[0].tracks[0]);
         assert_eq!(cells.len(), 8);
-        assert_eq!(cells[0], Cell::Note(36)); // C2
+        assert_eq!(cells[0], note(36)); // C2
         assert_eq!(cells[1], Cell::Sustain);
         assert_eq!(cells[2], Cell::Sustain);
         assert_eq!(cells[3], Cell::Sustain);
-        assert_eq!(cells[4], Cell::Note(39)); // Eb2
+        assert_eq!(cells[4], note(39)); // Eb2
         assert_eq!(cells[5], Cell::Sustain);
     }
 
@@ -900,13 +1060,13 @@ lead: C4 D4 Eb4 F#4 - . G4 -
 ";
         let pat = Pattern::parse(text).unwrap();
         let cells = notes(&pat.sections[0].tracks[0]);
-        assert_eq!(cells[0], Cell::Note(60));
-        assert_eq!(cells[1], Cell::Note(62));
-        assert_eq!(cells[2], Cell::Note(63));
-        assert_eq!(cells[3], Cell::Note(66));
+        assert_eq!(cells[0], note(60));
+        assert_eq!(cells[1], note(62));
+        assert_eq!(cells[2], note(63));
+        assert_eq!(cells[3], note(66));
         assert_eq!(cells[4], Cell::Rest);
         assert_eq!(cells[5], Cell::Sustain);
-        assert_eq!(cells[6], Cell::Note(67));
+        assert_eq!(cells[6], note(67));
         assert_eq!(cells[7], Cell::Rest);
     }
 
@@ -951,10 +1111,10 @@ lead: C#4 D#4 F#4 G#4
         let pat = Pattern::parse(text).unwrap();
         let cells = notes(&pat.sections[0].tracks[0]);
         assert_eq!(cells, &vec![
-            Cell::Note(61),
-            Cell::Note(63),
-            Cell::Note(66),
-            Cell::Note(68),
+            note(61),
+            note(63),
+            note(66),
+            note(68),
         ]);
     }
 
@@ -968,8 +1128,102 @@ hat: x - x - x - x -
         let pat = Pattern::parse(text).unwrap();
         assert_eq!(
             drum_hits(&pat.sections[0].tracks[0]),
-            &vec![true, false, true, false, true, false, true, false]
+            vec![true, false, true, false, true, false, true, false]
         );
+    }
+
+    #[test]
+    fn drum_velocity_x_vs_big_x_vs_o() {
+        let text = "\
+bpm: 120
+steps: 4
+kick: Xx-o
+";
+        let pat = Pattern::parse(text).unwrap();
+        if let TrackKind::Drum(vels) = &pat.sections[0].tracks[0].kind {
+            assert!((vels[0] - VEL_ACCENT).abs() < 0.01);
+            assert!((vels[1] - VEL_NORMAL).abs() < 0.01);
+            assert_eq!(vels[2], 0.0);
+            assert!((vels[3] - VEL_GHOST).abs() < 0.01);
+        } else {
+            panic!("expected drum track");
+        }
+    }
+
+    #[test]
+    fn global_swing_parsing() {
+        let text = "\
+bpm: 120
+steps: 4
+swing: 0.15
+kick: x-x-
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert!((pat.swing - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn per_section_bpm_and_swing() {
+        let text = "\
+bpm: 120
+steps: 4
+
+[verse]
+bpm: 100
+swing: 0.2
+kick: x-x-
+
+[chorus]
+bpm: 140
+kick: xxxx
+
+song: verse chorus
+";
+        let pat = Pattern::parse(text).unwrap();
+        assert_eq!(pat.bpm, 120);
+        assert_eq!(pat.sections[0].bpm, Some(100));
+        assert!((pat.sections[0].swing.unwrap() - 0.2).abs() < 0.001);
+        assert_eq!(pat.sections[1].bpm, Some(140));
+        assert!(pat.sections[1].swing.is_none()); // inherits global
+    }
+
+    #[test]
+    fn note_velocity_accent_and_ghost() {
+        let text = "\
+bpm: 120
+steps: 4
+lead: C4! D4? E4 F4
+";
+        let pat = Pattern::parse(text).unwrap();
+        let cells = notes(&pat.sections[0].tracks[0]);
+        assert_eq!(cells[0], Cell::Note(60, VEL_ACCENT));
+        assert_eq!(cells[1], Cell::Note(62, VEL_GHOST));
+        assert_eq!(cells[2], Cell::Note(64, VEL_NORMAL));
+        assert_eq!(cells[3], Cell::Note(65, VEL_NORMAL));
+    }
+
+    #[test]
+    fn per_track_adsr_and_gain_parsing() {
+        let text = "\
+bpm: 120
+steps: 4
+bass.wave: sine
+bass.attack: 10ms
+bass.decay: 0.1
+bass.sustain: 0.8
+bass.release: 50ms
+bass.gain: 1.5
+bass.gate: 0.5
+bass: C2 . . .
+";
+        let pat = Pattern::parse(text).unwrap();
+        let t = &pat.sections[0].tracks[0];
+        assert!((t.attack.unwrap() - 0.01).abs() < 0.001);
+        assert!((t.decay.unwrap() - 0.1).abs() < 0.001);
+        assert!((t.sustain.unwrap() - 0.8).abs() < 0.001);
+        assert!((t.release.unwrap() - 0.05).abs() < 0.001);
+        assert!((t.gain.unwrap() - 1.5).abs() < 0.001);
+        assert!((t.gate.unwrap() - 0.5).abs() < 0.001);
     }
 
     #[test]
@@ -1190,9 +1444,9 @@ pad: Cm . . . Fm . . .
         let pat = Pattern::parse(text).unwrap();
         let cells = chords(&pat.sections[0].tracks[0]);
         assert_eq!(cells.len(), 8);
-        assert_eq!(cells[0], ChordCell::Chord(vec![48, 51, 55])); // Cm in oct 3
+        assert_eq!(cells[0], chord(&[48, 51, 55])); // Cm in oct 3
         assert_eq!(cells[1], ChordCell::Sustain);
-        assert_eq!(cells[4], ChordCell::Chord(vec![53, 56, 60])); // Fm in oct 3
+        assert_eq!(cells[4], chord(&[53, 56, 60])); // Fm in oct 3
     }
 
     #[test]
@@ -1205,7 +1459,7 @@ pad: Cm . . .
 ";
         let pat = Pattern::parse(text).unwrap();
         let cells = chords(&pat.sections[0].tracks[0]);
-        assert_eq!(cells[0], ChordCell::Chord(vec![60, 63, 67])); // Cm in oct 4
+        assert_eq!(cells[0], chord(&[60, 63, 67])); // Cm in oct 4
     }
 
     #[test]
@@ -1220,7 +1474,7 @@ pad.octave: 5
 ";
         let pat = Pattern::parse(text).unwrap();
         let cells = chords(&pat.sections[0].tracks[0]);
-        assert_eq!(cells[0], ChordCell::Chord(vec![72, 75, 79])); // Cm in oct 5
+        assert_eq!(cells[0], chord(&[72, 75, 79])); // Cm in oct 5
     }
 
     #[test]
@@ -1245,8 +1499,8 @@ melody: C4 D4 C7 E4
 ";
         let pat = Pattern::parse(text).unwrap();
         let cells = notes(&pat.sections[0].tracks[0]);
-        assert_eq!(cells[0], Cell::Note(60));
-        assert_eq!(cells[2], Cell::Note(96)); // C in octave 7, NOT C dom7
+        assert_eq!(cells[0], note(60));
+        assert_eq!(cells[2], note(96)); // C in octave 7, NOT C dom7
     }
 
     // ── slice 5c: sections + song chain ────────────────────────────────────

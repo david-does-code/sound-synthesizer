@@ -31,6 +31,7 @@
 //! that `tick` now counts steps across the entire song, not just one bar.
 
 use crate::audio::{Drum, EngineHandle, MAX_VOICES};
+use crate::envelope::AdsrParams;
 use crate::pattern::{Cell, ChordCell, Pattern, TrackKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,17 +51,21 @@ pub struct Sequencer {
 enum ResolvedTrack {
     Drum {
         drum: Drum,
-        hits: Vec<bool>,
+        hits: Vec<f32>,
     },
     Notes {
         voice_idx: usize,
         cells: Vec<Cell>,
+        /// Gate length as fraction of step (0.0–1.0). `None` = legato (hold
+        /// until next note/rest).
+        gate: Option<f32>,
     },
     /// Chord tracks own `slots` consecutive voices starting at `voice_base`.
     Chord {
         voice_base: usize,
         slots: usize,
         cells: Vec<ChordCell>,
+        gate: Option<f32>,
     },
 }
 
@@ -68,6 +73,10 @@ enum ResolvedTrack {
 struct ResolvedSection {
     name: String,
     steps: usize,
+    /// Samples per step for this section (computed from BPM).
+    samples_per_step: u64,
+    /// Swing amount (0.0–1.0) for this section.
+    swing: f32,
     tracks: Vec<ResolvedTrack>,
     /// Distinct pitched-voice indices used by this section's note/chord tracks.
     /// Used at section transitions to release voices that drop out.
@@ -99,8 +108,6 @@ impl Sequencer {
         let stop = self.stop.clone();
 
         let sample_rate = engine.sample_rate() as f64;
-        let step_secs = 60.0 / pattern.bpm as f64 / 4.0;
-        let samples_per_step = (step_secs * sample_rate).round() as u64;
 
         // Pre-resolve voice allocations and per-section dispatch tables.
         let resolved_sections = pre_resolve(&pattern, &engine);
@@ -114,7 +121,10 @@ impl Sequencer {
             let start_sample = engine.current_sample() + lookahead_samples;
 
             let scheduling_start = Instant::now();
-            let mut tick: u64 = 0;
+            // Absolute sample position tracking (replaces tick * fixed step).
+            let mut cursor_sample: u64 = 0;
+            // Wall-clock seconds elapsed (for sleep scheduling).
+            let mut cursor_secs: f64 = 0.0;
             let mut prev_voice_set: Vec<usize> = Vec::new();
 
             'outer: loop {
@@ -122,20 +132,20 @@ impl Sequencer {
                     let Some(section) =
                         resolved_sections.iter().find(|s| s.name == entry.section)
                     else {
-                        // Should never happen — parser already validated.
                         continue;
                     };
+
+                    let sps = section.samples_per_step;
+                    let step_secs = sps as f64 / sample_rate;
+                    let swing = section.swing;
 
                     for _ in 0..entry.repeat {
                         if stop.load(Ordering::Relaxed) {
                             break 'outer;
                         }
 
-                        // Section transition: release any voices used by the
-                        // previous section that this one doesn't touch, so a
-                        // sustained bass note from the verse doesn't drone
-                        // through a kick-only outro.
-                        let transition_sample = start_sample + tick * samples_per_step;
+                        // Section transition: release voices that drop out.
+                        let transition_sample = start_sample + cursor_sample;
                         for v in &prev_voice_set {
                             if !section.voice_set.contains(v) {
                                 engine.schedule_note_off(*v, transition_sample);
@@ -147,15 +157,25 @@ impl Sequencer {
                                 break 'outer;
                             }
 
-                            let target_sample = start_sample + tick * samples_per_step;
+                            // Swing: nudge odd-numbered steps later. The swing
+                            // amount is a fraction of one step's duration.
+                            let swing_offset = if step % 2 == 1 {
+                                (swing as f64 * sps as f64) as u64
+                            } else {
+                                0
+                            };
+
+                            let target_sample = start_sample + cursor_sample + swing_offset;
 
                             for track in &section.tracks {
-                                dispatch_step(&engine, track, step, target_sample);
+                                dispatch_step(&engine, track, step, target_sample, sps);
                             }
 
-                            tick += 1;
+                            cursor_sample += sps;
+                            cursor_secs += step_secs;
+
                             let next_wakeup = scheduling_start
-                                + Duration::from_secs_f64(step_secs * tick as f64);
+                                + Duration::from_secs_f64(cursor_secs);
                             let now = Instant::now();
                             if next_wakeup > now {
                                 thread::sleep(next_wakeup - now);
@@ -203,10 +223,36 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
     let mut alloc: HashMap<String, VoiceAlloc> = HashMap::new();
     let mut next_voice: usize = 0;
 
+    /// Build an AdsrParams from per-track overrides, falling back to the
+    /// engine default for any field not specified.
+    fn build_adsr(track: &crate::pattern::Track) -> Option<AdsrParams> {
+        if track.attack.is_none()
+            && track.decay.is_none()
+            && track.sustain.is_none()
+            && track.release.is_none()
+        {
+            return None;
+        }
+        let def = AdsrParams::default();
+        Some(AdsrParams {
+            attack: track.attack.unwrap_or(def.attack),
+            decay: track.decay.unwrap_or(def.decay),
+            sustain: track.sustain.unwrap_or(def.sustain),
+            release: track.release.unwrap_or(def.release),
+        })
+    }
+
     for section in &pattern.sections {
         for track in &section.tracks {
             match &track.kind {
-                TrackKind::Drum(_) => {} // drums don't need pitched voices
+                TrackKind::Drum(_) => {
+                    // Apply per-drum gain if specified.
+                    if let Some(gain) = track.gain {
+                        if let Some(drum) = resolve_drum(&track.name) {
+                            engine.set_drum_gain(drum, gain);
+                        }
+                    }
+                }
                 TrackKind::Notes(_) => {
                     if alloc.contains_key(&track.name) {
                         continue;
@@ -221,6 +267,12 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     if let Some(wave) = track.wave {
                         engine.set_voice_waveform(next_voice, wave);
                     }
+                    if let Some(adsr) = build_adsr(track) {
+                        engine.set_voice_adsr(next_voice, adsr);
+                    }
+                    if let Some(gain) = track.gain {
+                        engine.set_voice_gain(next_voice, gain);
+                    }
                     alloc.insert(track.name.clone(), VoiceAlloc { base: next_voice, slots: 1 });
                     next_voice += 1;
                 }
@@ -231,10 +283,6 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     }
 
                     if let Some(existing) = alloc.get(&track.name) {
-                        // Track appeared in an earlier section. If a later
-                        // section needs more slots than we allocated, we can't
-                        // safely expand without shifting everything else;
-                        // warn and the extra notes get dropped at dispatch.
                         if existing.slots < chord_size {
                             eprintln!(
                                 "warning: chord track {:?} has chords of {} notes in a later section but only {} voices reserved — extra notes will be dropped",
@@ -254,9 +302,20 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                         continue;
                     }
 
+                    let adsr = build_adsr(track);
                     if let Some(wave) = track.wave {
                         for v in next_voice..(next_voice + chord_size) {
                             engine.set_voice_waveform(v, wave);
+                        }
+                    }
+                    if let Some(adsr) = adsr {
+                        for v in next_voice..(next_voice + chord_size) {
+                            engine.set_voice_adsr(v, adsr);
+                        }
+                    }
+                    if let Some(gain) = track.gain {
+                        for v in next_voice..(next_voice + chord_size) {
+                            engine.set_voice_gain(v, gain);
                         }
                     }
                     alloc.insert(
@@ -290,6 +349,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                         tracks.push(ResolvedTrack::Notes {
                             voice_idx: va.base,
                             cells: cells.clone(),
+                            gate: track.gate,
                         });
                         push_unique(&mut voice_set, va.base);
                     }
@@ -300,6 +360,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                             voice_base: va.base,
                             slots: va.slots,
                             cells: cells.clone(),
+                            gate: track.gate,
                         });
                         for s in 0..va.slots {
                             push_unique(&mut voice_set, va.base + s);
@@ -308,9 +369,20 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                 }
             }
         }
+        // Per-section BPM: fall back to global.
+        let section_bpm = section.bpm.unwrap_or(pattern.bpm);
+        let sample_rate = engine.sample_rate() as f64;
+        let step_secs = 60.0 / section_bpm as f64 / 4.0;
+        let samples_per_step = (step_secs * sample_rate).round() as u64;
+
+        // Per-section swing: fall back to global.
+        let swing = section.swing.unwrap_or(pattern.swing);
+
         resolved.push(ResolvedSection {
             name: section.name.clone(),
             steps: section.steps,
+            samples_per_step,
+            swing,
             tracks,
             voice_set,
         });
@@ -340,28 +412,38 @@ fn dispatch_step(
     track: &ResolvedTrack,
     step: usize,
     target_sample: u64,
+    samples_per_step: u64,
 ) {
     match track {
         ResolvedTrack::Drum { drum, hits } => {
-            if hits[step] {
-                engine.schedule_at(*drum, target_sample);
+            let vel = hits[step];
+            if vel > 0.0 {
+                engine.schedule_drum_at(*drum, target_sample, vel);
             }
         }
-        ResolvedTrack::Notes { voice_idx, cells } => match cells[step] {
-            Cell::Note(midi) => {
-                engine.schedule_note_on(*voice_idx, target_sample, midi);
+        ResolvedTrack::Notes { voice_idx, cells, gate } => match cells[step] {
+            Cell::Note(midi, vel) => {
+                engine.schedule_note_on_vel(*voice_idx, target_sample, midi, vel);
+                if let Some(g) = gate {
+                    let off_at = target_sample + (*g as f64 * samples_per_step as f64) as u64;
+                    engine.schedule_note_off(*voice_idx, off_at);
+                }
             }
             Cell::Rest => {
                 engine.schedule_note_off(*voice_idx, target_sample);
             }
             Cell::Sustain => {}
         },
-        ResolvedTrack::Chord { voice_base, slots, cells } => match &cells[step] {
+        ResolvedTrack::Chord { voice_base, slots, cells, gate } => match &cells[step] {
             ChordCell::Chord(notes) => {
                 for s in 0..*slots {
                     let voice = voice_base + s;
-                    if let Some(midi) = notes.get(s) {
-                        engine.schedule_note_on(voice, target_sample, *midi);
+                    if let Some((midi, vel)) = notes.get(s) {
+                        engine.schedule_note_on_vel(voice, target_sample, *midi, *vel);
+                        if let Some(g) = gate {
+                            let off_at = target_sample + (*g as f64 * samples_per_step as f64) as u64;
+                            engine.schedule_note_off(voice, off_at);
+                        }
                     } else {
                         engine.schedule_note_off(voice, target_sample);
                     }

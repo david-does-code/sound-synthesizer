@@ -7,8 +7,11 @@
       "Bash(cargo clippy *)",
       "Bash(cargo fmt *)",
       "Bash(ls *)",
+      "Bash(mkdir -p /home/david/Work/personal/learning/colorsynth/**)",
       "Edit(/home/david/Work/personal/learning/sound-synthesizer/**)",
-      "Write(/home/david/Work/personal/learning/sound-synthesizer/**)"
+      "Write(/home/david/Work/personal/learning/sound-synthesizer/**)",
+      "Edit(/home/david/Work/personal/learning/colorsynth/**)",
+      "Write(/home/david/Work/personal/learning/colorsynth/**)"
     ]
   }
 }

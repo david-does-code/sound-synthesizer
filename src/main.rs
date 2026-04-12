@@ -428,7 +428,11 @@ fn play_pattern(path: &str) {
 
     println!("  🥁 Playing {path}");
     println!("  ────────────────────────────────────────");
-    println!("  Tempo: {} BPM", pattern.bpm);
+    print!("  Tempo: {} BPM", pattern.bpm);
+    if pattern.swing > 0.0 {
+        print!("  Swing: {:.0}%", pattern.swing * 100.0);
+    }
+    println!();
 
     // Song chain summary.
     let chain: Vec<String> = pattern
@@ -452,7 +456,15 @@ fn play_pattern(path: &str) {
     println!();
 
     for section in &pattern.sections {
-        println!("  [{}]  ({} steps)", section.name, section.steps);
+        let mut section_info = format!("  [{}]  ({} steps", section.name, section.steps);
+        if let Some(bpm) = section.bpm {
+            section_info.push_str(&format!(", {} BPM", bpm));
+        }
+        if let Some(swing) = section.swing {
+            section_info.push_str(&format!(", swing {:.0}%", swing * 100.0));
+        }
+        section_info.push(')');
+        println!("{section_info}");
         for t in &section.tracks {
             let wave_label = match t.wave {
                 Some(w) => format!(" [{}]", w.name().to_lowercase()),
@@ -460,14 +472,18 @@ fn play_pattern(path: &str) {
             };
             match &t.kind {
                 TrackKind::Drum(hits) => {
-                    let visual: String = hits.iter().map(|h| if *h { 'x' } else { '-' }).collect();
+                    let visual: String = hits.iter().map(|v| {
+                        if *v >= crate::pattern::VEL_ACCENT - 0.01 { 'X' }
+                        else if *v > 0.0 { 'x' }
+                        else { '-' }
+                    }).collect();
                     println!("    🥁 {:<8}{wave_label} {}", t.name, visual);
                 }
                 TrackKind::Notes(cells) => {
                     let visual: String = cells
                         .iter()
                         .map(|c| match c {
-                            Cell::Note(_) => 'N',
+                            Cell::Note(_, _) => 'N',
                             Cell::Sustain => '.',
                             Cell::Rest => '-',
                         })
@@ -494,14 +510,8 @@ fn play_pattern(path: &str) {
     let engine = AudioEngine::new();
     let engine_handle = engine.engine_handle();
 
-    // Diagnostic: show timing math so we can spot any device-specific issue.
     let sample_rate = engine_handle.sample_rate() as f64;
-    let step_secs = 60.0 / pattern.bpm as f64 / 4.0;
-    let samples_per_step = (step_secs * sample_rate).round() as u64;
-    println!(
-        "  audio: {sample_rate} Hz   step: {:.3} ms ({samples_per_step} samples/step)",
-        step_secs * 1000.0
-    );
+    println!("  audio: {sample_rate} Hz");
     println!();
 
     let mut seq = Sequencer::new(pattern, engine_handle);

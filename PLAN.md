@@ -86,30 +86,24 @@ This is the foundation for making actual music.
       are global across sections so a `bass` line carries through cleanly.
       Voices owned by tracks that disappear at a section boundary are released.
 
+- [x] **Slice 5d — Per-track ADSR**: each track has its own envelope
+      (`pad.attack: 300ms`, `bass.release: 50ms`). Per-voice ADSR atomics
+      in the engine, falling back to global when not set.
+- [x] **Slice 5e — Per-track volume / mixing**: `kick.gain: 1.3`,
+      `hihat.gain: 0.5`. Per-voice and per-drum gain multipliers.
+- [x] **Slice 5f — Velocity / dynamics**: per-cell loudness. Drums:
+      `X` = accent (1.0), `x` = normal (0.7), `o` = ghost (0.35).
+      Notes: `C4!` for accent, `C4?` for ghost. Velocity packed into
+      voice events (u8) and drum schedule (u16) atomics.
+- [x] **Slice 5g — Note gate length**: `bass.gate: 0.5` — note releases
+      after half the step duration. Auto note-off scheduling in sequencer.
+- [x] **Slice 5h — Swing / shuffle**: `swing: 0.15` global or per-section.
+      Nudges odd-numbered steps later by a fraction of step duration.
+- [x] **Slice 5i — Per-section BPM**: `bpm:` inside a `[section]` header
+      overrides the global tempo. Sequencer tracks absolute sample position
+      with per-section step size instead of a single global rate.
+
 **Next slices (in build order):**
-- [ ] **Slice 5d — Per-track ADSR**: each track can have its own envelope
-      (`pad.attack: 200ms`, `bass.release: 50ms`). A pad swells in slowly;
-      a pluck snaps and fades; a lead has fast attack with sustain. Currently
-      every voice shares the global ADSR.
-- [ ] **Slice 5e — Per-track volume / mixing**: `kick.gain: 1.0`,
-      `hihat.gain: 0.4`. Lets the kick punch while the hi-hat sits behind.
-      Without mixing, all tracks come out at the same level which feels flat.
-- [ ] **Slice 5f — Velocity / dynamics**: per-cell loudness. Today every hit
-      is the same volume. Real music has accents (loud beats), ghost notes
-      (quiet snare hits), swells. Probable syntax: `kick: X---x---X---x---`
-      where capital `X` is accented and lowercase `x` is normal. For note
-      tracks, maybe `C4!` for accented and `C4?` for ghost.
-- [ ] **Slice 5g — Note gate length**: how long a note holds within its
-      step (staccato vs legato). Currently a note plays from trigger to next
-      trigger/rest. Probable syntax: a track-level `gate: 0.5` (half-step),
-      or per-cell `C4/2` (held for half a step).
-- [ ] **Slice 5h — Swing / shuffle**: nudge every other 16th-note slightly
-      late so the rhythm "breathes". Track property: `swing: 0.15` (= 15%
-      shuffle). The difference between a robotic beat and one that grooves.
-- [ ] **Slice 5i — Tempo / time signature changes**: tempo curves (`bpm:
-      120 → 140 over 8 bars`), time signature changes (`time: 6/8`), and
-      multiple time signatures within a song. Today we're locked to 4/4 at
-      a fixed BPM.
 - [ ] **Slice 5j — Visual grid in the TUI**: third UI mode (after piano/ADSR)
       showing the pattern grid with a moving playhead.
 - [ ] **Slice 5k — TUI editing**: toggle steps with arrow keys + space, save
@@ -124,12 +118,17 @@ hard time-cutoffs cause clicks (discontinuity at non-zero amplitude), and
 sample-accurate scheduling vs. wall-clock scheduling — the latter suffers from
 audio buffer jitter that the ear can hear as one beat being "off". Scientific
 pitch notation (middle C = C4 = MIDI 60), packed atomic event encoding for
-lock-free voice scheduling, and the C minor pentatonic / Eb major scale flavor
-that drives melodic indie/chiptune music.
+lock-free voice scheduling, the C minor pentatonic / Eb major scale flavor
+that drives melodic indie/chiptune music, ADSR per-instrument character (pad
+swells vs pluck snaps vs bass punch), gain staging in a mix (loud kick +
+quiet hi-hat = depth), velocity as musical phrasing (accents give groove
+life, ghost notes add subtlety), gate length as articulation (staccato
+bounce vs legato smoothness), and swing as the difference between a
+robotic grid and a groove that breathes.
 
-**Concepts to learn next**: subtractive timbres (sine vs square vs saw character),
-chord construction (triads, 7ths, sus chords), inversions, voicing, song form
-(intro / verse / chorus / bridge), and the difference between a riff and a song.
+**Concepts to learn next**: time signatures beyond 4/4, tempo curves
+(accelerando/ritardando), filter types and subtractive synthesis,
+and the visual representation of a step grid.
 
 ### Phase 6: Sampling & Drum Kits
 
@@ -171,9 +170,14 @@ kinds of tracks:
 - **Chord tracks**: chord shorthand tokens like `Cm`, `G7`, `Fmaj7`, `Dsus4`,
   played as multi-note stacks
 
-Per-track properties: `name.wave: <sine|square|saw|triangle>` and
-`name.octave: <int>` (chord root octave). Auto-detection picks the right
-track kind from row contents.
+Per-track properties: `name.wave:`, `name.octave:`, `name.attack:`,
+`name.decay:`, `name.sustain:`, `name.release:`, `name.gain:`, `name.gate:`.
+Time values accept seconds (`0.2`) or milliseconds (`200ms`).
+
+Global/per-section headers: `bpm:`, `steps:`, `swing:` (0.0–1.0).
+
+Drum velocity: `X` = accent (1.0), `x` = normal (0.7), `o` = ghost (0.35).
+Note velocity: `C4!` = accent, `C4?` = ghost.
 
 ```
 # C minor cinematic groove: drums + sine bass + triangle pad + square lead.
@@ -200,9 +204,8 @@ or become melodic / chord tracks consuming voices from the 8-voice pitched
 pool in declaration order. Comments use `#` and must start at the beginning
 of a line so `F#4` parses as F-sharp 4.
 
-Coming soon (slices 5c-5i): song chaining across multi-bar blocks, per-track
-ADSR, gain, velocity, gate length, swing, tempo curves, and time-signature
-changes.
+Coming soon (slices 5j-5l): TUI grid view with playhead, TUI step editing
+with live-reload, WAV export.
 
 ### Phase 8: Filters, Effects & Modulation
 
