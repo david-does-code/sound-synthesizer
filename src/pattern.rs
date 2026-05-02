@@ -171,6 +171,22 @@ pub struct Track {
     pub filter_decay: Option<f32>,
     pub filter_sustain: Option<f32>,
     pub filter_release: Option<f32>,
+    /// Synthesis model. `None` = oscillator (the default). `Some(Model::Pluck)`
+    /// switches to Karplus-Strong physical modeling for plucked-string sounds.
+    pub model: Option<SynthModel>,
+    /// Pluck decay (per-loop multiplier, ~0.99–0.999). Lower = shorter sustain.
+    /// Only meaningful with `model: pluck`.
+    pub pluck_decay: Option<f32>,
+    /// Pluck brightness (0..1, 0.5 = textbook neutral, higher = ringy/bright).
+    /// Only meaningful with `model: pluck`.
+    pub pluck_brightness: Option<f32>,
+}
+
+/// Which synthesis model a track uses. Default (when unset on a Track) is
+/// the oscillator path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynthModel {
+    Pluck,
 }
 
 /// What this track plays.
@@ -539,6 +555,9 @@ impl Pattern {
                         filter_decay: track_props.filter_decay,
                         filter_sustain: track_props.filter_sustain,
                         filter_release: track_props.filter_release,
+                        model: track_props.model,
+                        pluck_decay: track_props.pluck_decay,
+                        pluck_brightness: track_props.pluck_brightness,
                     });
                 }
             }
@@ -646,6 +665,9 @@ struct TrackProps {
     filter_decay: Option<f32>,
     filter_sustain: Option<f32>,
     filter_release: Option<f32>,
+    model: Option<SynthModel>,
+    pluck_decay: Option<f32>,
+    pluck_brightness: Option<f32>,
 }
 
 fn apply_property(
@@ -806,6 +828,42 @@ fn apply_property(
                 }
             })?;
             out.filter_sustain = Some(level.clamp(0.0, 1.0));
+        }
+        "model" => {
+            let model = match value.to_ascii_lowercase().as_str() {
+                "pluck" | "karplus" | "string" => SynthModel::Pluck,
+                _ => {
+                    return Err(PatternParseError::InvalidPropertyValue {
+                        line: line_no,
+                        track: track.to_string(),
+                        prop: prop.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+            };
+            out.model = Some(model);
+        }
+        "pluck_decay" => {
+            let d: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.pluck_decay = Some(d.clamp(0.5, 0.9999));
+        }
+        "pluck_brightness" => {
+            let b: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.pluck_brightness = Some(b.clamp(0.0, 1.0));
         }
         _ => {
             return Err(PatternParseError::UnknownProperty {

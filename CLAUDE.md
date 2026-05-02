@@ -39,6 +39,12 @@ See PLAN.md for the roadmap and current progress.
   cutoff; bypassed by default (cutoff 20 kHz, env depth 0) so voices that
   don't ask for one pay zero per-sample cost. Cutoff modulation is
   exponential — `cutoff = base * 2^(env * env_octaves)`.
+- `src/pluck.rs` — Karplus-Strong plucked-string physical model. A delay
+  line of length `sample_rate / freq` is filled with noise on trigger and
+  self-feeds through a one-zero lowpass plus a small decay multiplier
+  each loop, giving very convincing guitar/harp/koto-like tone for ~50
+  lines of code. Voice switches between oscillator and pluck via
+  `pluck_enabled`; the lowpass filter still applies on top of either path.
 - `src/keyboard.rs` — Reads raw keyboard events from Linux evdev (`/dev/input/`).
   Sends note, waveform, octave, mode toggle, and arrow key events over an MPSC channel.
 - `src/pattern.rs` — Pattern file format and parser. Defines `Pattern` (with `bpm`,
@@ -157,7 +163,9 @@ sub-octave layer (`name.sub`), master reverb (`reverb:` global header),
 hi-hat lowpass, `steps_per_beat` for non-16th-grid songs, and
 **resonant lowpass + filter envelope** (`name.cutoff`, `name.resonance`,
 `name.filter_env`, plus optional `name.filter_attack/decay/sustain/release`
-falling back to amp ADSR).
+falling back to amp ADSR), and **Karplus-Strong pluck synthesis**
+(`name.model: pluck`, optional `name.pluck_decay`, `name.pluck_brightness`)
+for plucked-string tones the oscillator can't reach.
 
 **Pick next session by mood:**
 - **5j + 5k**: TUI grid view + live step editing. Biggest composition

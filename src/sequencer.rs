@@ -32,7 +32,7 @@
 
 use crate::audio::{Drum, EngineHandle, MAX_VOICES};
 use crate::envelope::AdsrParams;
-use crate::pattern::{Cell, ChordCell, Pattern, TrackKind};
+use crate::pattern::{Cell, ChordCell, Pattern, SynthModel, TrackKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -297,6 +297,20 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
         }
     }
 
+    /// Push the per-track synthesis-model config (pluck on/off + params).
+    fn apply_model(
+        engine: &EngineHandle,
+        track: &crate::pattern::Track,
+        range: std::ops::Range<usize>,
+    ) {
+        let enabled = matches!(track.model, Some(SynthModel::Pluck));
+        let decay = track.pluck_decay.unwrap_or(0.996);
+        let brightness = track.pluck_brightness.unwrap_or(0.5);
+        for v in range {
+            engine.set_voice_pluck(v, enabled, decay, brightness);
+        }
+    }
+
     for section in &pattern.sections {
         for track in &section.tracks {
             match &track.kind {
@@ -335,6 +349,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                         engine.set_voice_sub(next_voice, sub);
                     }
                     apply_filter(engine, track, next_voice..next_voice + 1);
+                    apply_model(engine, track, next_voice..next_voice + 1);
                     alloc.insert(track.name.clone(), VoiceAlloc { base: next_voice, slots: 1 });
                     next_voice += 1;
                 }
@@ -391,6 +406,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                         }
                     }
                     apply_filter(engine, track, next_voice..next_voice + chord_size);
+                    apply_model(engine, track, next_voice..next_voice + chord_size);
                     alloc.insert(
                         track.name.clone(),
                         VoiceAlloc { base: next_voice, slots: chord_size },

@@ -1,5 +1,6 @@
 use crate::envelope::{AdsrParams, Envelope};
 use crate::filter::SvfLowpass;
+use crate::pluck::KarplusStrong;
 use crate::reverb::Reverb;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::f32::consts::TAU;
@@ -299,11 +300,33 @@ pub struct EngineHandle {
     voice_filter_env: Arc<[AtomicU32; MAX_VOICES]>,
     /// Per-voice filter ADSR (packed same as voice_adsr; 0 = use amp ADSR).
     voice_filter_adsr: Arc<[AtomicU64; MAX_VOICES]>,
+    /// Per-voice pluck-model config: bits 0..32 = decay (f32), bits 32..63 =
+    /// brightness (f32, top bit reserved as enabled flag).
+    /// Pack: bit 63 = enabled, bits 32..63 hold brightness as f32 with sign
+    /// stripped (we only need 0..1), bits 0..32 hold decay as f32.
+    voice_pluck: Arc<[AtomicU64; MAX_VOICES]>,
     sample_clock: Arc<AtomicU64>,
     /// Master reverb wet/dry mix as f32 bits. Read once per frame in the
     /// audio callback and pushed into the Reverb instance.
     reverb_mix: Arc<AtomicU32>,
     sample_rate: f32,
+}
+
+/// Pack pluck config into a single u64 for lock-free atomic transfer.
+/// Layout: bit 63 = enabled, bits 32..63 = brightness f32 (low 31 bits, sign
+/// always 0 since brightness is 0..1), bits 0..32 = decay f32 bits.
+fn pack_pluck(enabled: bool, decay: f32, brightness: f32) -> u64 {
+    let dec_bits = decay.to_bits() as u64;
+    let bright_bits = (brightness.clamp(0.0, 1.0).to_bits() & 0x7FFF_FFFF) as u64;
+    let flag = if enabled { 1u64 << 63 } else { 0 };
+    flag | (bright_bits << 32) | dec_bits
+}
+
+fn unpack_pluck(packed: u64) -> (bool, f32, f32) {
+    let enabled = (packed >> 63) & 1 == 1;
+    let bright_bits = ((packed >> 32) & 0x7FFF_FFFF) as u32;
+    let dec_bits = (packed & 0xFFFF_FFFF) as u32;
+    (enabled, f32::from_bits(dec_bits), f32::from_bits(bright_bits))
 }
 
 impl EngineHandle {
@@ -445,6 +468,16 @@ impl EngineHandle {
             self.voice_filter_adsr[voice_idx].store(pack_adsr(&params), Ordering::Relaxed);
         }
     }
+
+    /// Enable / configure the Karplus-Strong pluck model on a voice.
+    /// `decay` is the per-loop multiplier (typical 0.99–0.999); `brightness`
+    /// is 0..1 (0.5 = textbook neutral).
+    pub fn set_voice_pluck(&self, voice_idx: usize, enabled: bool, decay: f32, brightness: f32) {
+        if voice_idx < MAX_VOICES {
+            self.voice_pluck[voice_idx]
+                .store(pack_pluck(enabled, decay, brightness), Ordering::Relaxed);
+        }
+    }
 }
 
 /// State for a single voice inside the audio callback.
@@ -498,6 +531,10 @@ pub struct Voice {
     /// non-trivial env modulation). Lets us short-circuit the filter math
     /// for voices that don't use one.
     filter_enabled: bool,
+    /// Karplus-Strong plucked-string model. When `pluck_enabled` is true,
+    /// the voice synthesizes from this instead of the oscillator + sub.
+    pluck: KarplusStrong,
+    pluck_enabled: bool,
 }
 
 impl Voice {
@@ -526,6 +563,20 @@ impl Voice {
             filter_resonance: 0.0,
             filter_env_octaves: 0.0,
             filter_enabled: false,
+            // Distinct seed across voices so plucks of the same chord don't
+            // share an identical noise burst (which would phase-cancel).
+            pluck: KarplusStrong::new(0xDEAD_BEEF),
+            pluck_enabled: false,
+        }
+    }
+
+    /// Enable / configure the Karplus-Strong pluck model for this voice.
+    /// `decay` is the per-loop multiplier (~0.99–0.999); `brightness` is
+    /// 0..1 with 0.5 as the textbook neutral value.
+    pub fn set_pluck(&mut self, enabled: bool, decay: f32, brightness: f32) {
+        self.pluck_enabled = enabled;
+        if enabled {
+            self.pluck.set_params(decay, brightness);
         }
     }
 
@@ -565,6 +616,12 @@ impl Voice {
         if self.filter_enabled {
             self.filter_env.gate_on();
         }
+        if self.pluck_enabled {
+            // Re-pluck: fresh noise burst at the new pitch. Velocity scales
+            // the burst amplitude — louder pluck = louder string.
+            self.pluck
+                .trigger(self.frequency, self.envelope.sample_rate(), velocity);
+        }
         self.click_current = self.click_initial;
     }
 
@@ -591,6 +648,26 @@ impl Voice {
         if env_amp <= 0.0 {
             self.active = false;
             return 0.0;
+        }
+
+        // Karplus-Strong path: the delay-line + lowpass loop produces the
+        // sample directly. Velocity is already baked into the noise burst at
+        // trigger time, so we don't multiply it in again here. We still apply
+        // the amp envelope — that gives us the attack ramp and a clean
+        // release fade on note-off, on top of the K-S natural decay.
+        if self.pluck_enabled {
+            let mut value = self.pluck.next_sample() * env_amp;
+            if self.filter_enabled {
+                let env = self.filter_env.next_sample();
+                let cutoff = self.base_cutoff_hz * (env * self.filter_env_octaves).exp2();
+                value = self.filter.process(
+                    value,
+                    cutoff,
+                    self.filter_resonance,
+                    self.envelope.sample_rate(),
+                );
+            }
+            return value;
         }
 
         let mut value = waveform.sample(self.phase);
@@ -702,6 +779,8 @@ pub struct AudioEngine {
     /// Per-voice filter ADSR (packed). 0 = use amp ADSR (set explicitly when
     /// the sequencer pushes per-track filter envelopes).
     voice_filter_adsr: Arc<[AtomicU64; MAX_VOICES]>,
+    /// Per-voice Karplus-Strong config (packed enable / decay / brightness).
+    voice_pluck: Arc<[AtomicU64; MAX_VOICES]>,
     sample_rate: f32,
 }
 
@@ -816,6 +895,12 @@ impl AudioEngine {
             std::array::from_fn(|_| AtomicU64::new(0)),
         );
         let voice_filter_adsr_clone = voice_filter_adsr.clone();
+
+        // Per-voice pluck config: 0 = disabled (the high bit is the enable flag).
+        let voice_pluck: Arc<[AtomicU64; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU64::new(0)),
+        );
+        let voice_pluck_clone = voice_pluck.clone();
         let mut reverb = Reverb::new(0.0);
         // Distinct seeds so each noise drum has its own RNG stream.
         let mut drum_voices: [DrumVoice; NUM_DRUMS] = [
@@ -884,6 +969,11 @@ impl AudioEngine {
                             voice.filter_env.set_params(unpack_adsr(effective_f));
                             voice.last_filter_adsr = effective_f;
                         }
+
+                        // Pluck (Karplus-Strong) config.
+                        let pluck_packed = voice_pluck_clone[i].load(Ordering::Relaxed);
+                        let (enabled, decay, brightness) = unpack_pluck(pluck_packed);
+                        voice.set_pluck(enabled, decay, brightness);
                     }
 
                     // Process commands from the main thread
@@ -1043,6 +1133,7 @@ impl AudioEngine {
             voice_resonance,
             voice_filter_env,
             voice_filter_adsr,
+            voice_pluck,
             sample_rate,
         }
     }
@@ -1064,6 +1155,7 @@ impl AudioEngine {
             voice_resonance: self.voice_resonance.clone(),
             voice_filter_env: self.voice_filter_env.clone(),
             voice_filter_adsr: self.voice_filter_adsr.clone(),
+            voice_pluck: self.voice_pluck.clone(),
             sample_clock: self.sample_clock.clone(),
             reverb_mix: self.reverb_mix.clone(),
             sample_rate: self.sample_rate,

@@ -10,7 +10,7 @@
 
 use crate::audio::{Drum, DrumVoice, Voice, Waveform, MAX_VOICES, NUM_DRUMS};
 use crate::envelope::AdsrParams;
-use crate::pattern::{Cell, ChordCell, Pattern, Track, TrackKind};
+use crate::pattern::{Cell, ChordCell, Pattern, SynthModel, Track, TrackKind};
 use crate::reverb::Reverb;
 use std::collections::HashMap;
 use std::path::Path;
@@ -216,6 +216,7 @@ pub fn render_to_wav(
     // for any track that has at least one filter property set. Falls back
     // to amp ADSR for any unspecified filter envelope params.
     apply_filter_settings(pattern, &alloc, &voice_adsr, &mut voices);
+    apply_model_settings(pattern, &alloc, &mut voices);
     let mut drums: [DrumVoice; NUM_DRUMS] = [
         DrumVoice::new(Drum::Kick, SAMPLE_RATE, 0x1234_5678),
         DrumVoice::new(Drum::Snare, SAMPLE_RATE, 0x9E37_79B9),
@@ -525,6 +526,39 @@ fn apply_filter_settings(
                 };
                 voices[idx].set_filter(cutoff, resonance, env_oct);
                 voices[idx].filter_env.set_params(filter_adsr);
+            }
+        }
+    }
+}
+
+/// Configure per-voice synthesis model (default oscillator vs Karplus-Strong
+/// pluck) for the offline renderer, matching `sequencer::pre_resolve`.
+fn apply_model_settings(
+    pattern: &Pattern,
+    alloc: &HashMap<String, VoiceAlloc>,
+    voices: &mut [Voice],
+) {
+    let mut applied: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for section in &pattern.sections {
+        for track in &section.tracks {
+            let Some(va) = alloc.get(&track.name) else { continue };
+            let enabled = matches!(track.model, Some(SynthModel::Pluck));
+            // Skip tracks that don't ask for an alternative model — the
+            // default-constructed Voice has pluck disabled, oscillator path.
+            if !enabled
+                && track.pluck_decay.is_none()
+                && track.pluck_brightness.is_none()
+            {
+                continue;
+            }
+            let decay = track.pluck_decay.unwrap_or(0.996);
+            let brightness = track.pluck_brightness.unwrap_or(0.5);
+            for s in 0..va.slots {
+                let idx = va.base + s;
+                if !applied.insert(idx) {
+                    continue;
+                }
+                voices[idx].set_pluck(enabled, decay, brightness);
             }
         }
     }

@@ -13,25 +13,21 @@ bpm: 105
 steps_per_beat: 2
 reverb: 0.18
 
-# Pad - moved from triangle to saw + lowpass to get a pluck-pad character
-# closer to fingerpicked acoustic. The filter envelope opens fast then closes
-# back down, so each chord change has a percussive transient instead of the
-# static wash we had in v1.
-pad.wave: saw
-pad.attack: 15ms
-pad.decay: 0.4
-pad.sustain: 0.45
-pad.release: 350ms
-pad.octave: 4
-pad.gain: 0.6
+# Pad - now a Karplus-Strong plucked-string model. Each chord change
+# re-plucks the strings with a fresh noise burst; the natural K-S decay
+# gives the fingerpicked-acoustic character we couldn't reach with
+# subtractive synthesis alone. Light lowpass on top to mellow the brightest
+# transient.
+pad.model: pluck
+pad.pluck_decay: 0.9992
+pad.pluck_brightness: 0.5
+pad.octave: 3
+pad.attack: 3ms
+pad.release: 600ms
+pad.gain: 1.2
 
-pad.cutoff: 350Hz
-pad.resonance: 0.25
-pad.filter_env: 2.5
-pad.filter_attack: 8ms
-pad.filter_decay: 0.35
-pad.filter_sustain: 0.15
-pad.filter_release: 250ms
+pad.cutoff: 3kHz
+pad.resonance: 0.0
 
 # Bass - sine roots, gentle pluck
 bass.wave: sine

@@ -2,6 +2,7 @@ mod audio;
 mod envelope;
 mod filter;
 mod keyboard;
+mod pluck;
 mod notes;
 mod pattern;
 mod render;
