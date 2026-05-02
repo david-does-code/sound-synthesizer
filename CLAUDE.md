@@ -163,9 +163,16 @@ sub-octave layer (`name.sub`), master reverb (`reverb:` global header),
 hi-hat lowpass, `steps_per_beat` for non-16th-grid songs, and
 **resonant lowpass + filter envelope** (`name.cutoff`, `name.resonance`,
 `name.filter_env`, plus optional `name.filter_attack/decay/sustain/release`
-falling back to amp ADSR), and **Karplus-Strong pluck synthesis**
+falling back to amp ADSR), **Karplus-Strong pluck synthesis**
 (`name.model: pluck`, optional `name.pluck_decay`, `name.pluck_brightness`)
-for plucked-string tones the oscillator can't reach.
+for plucked-string tones the oscillator can't reach, and **per-voice
+pitch vibrato** (`name.vibrato_rate: 5hz`, `name.vibrato_depth: 0.15`
+semitones) — sine LFO modulating oscillator pitch. Phase persists across
+notes so stacked voices with similar rates drift naturally relative to
+each other; that's most of what makes a vocal harmony stack feel human.
+Pluck path is intentionally not modulated (delay-line resampling is its
+own problem). See `patterns/harmony_stack_demo.pat` for a chord-tone
+3-voice stack + vibrato demo.
 
 **Pick next session by mood:**
 - **Add a lead line to atgt** (in progress — pipeline set up, melody not
@@ -180,8 +187,15 @@ for plucked-string tones the oscillator can't reach.
   were left on the table.
 - **5j + 5k**: TUI grid view + live step editing. Biggest composition
   unlock — turns the iteration loop from "edit-render-listen" into live.
-- **Phase 8 starters**: LFO + vibrato, portamento, 4-pole/ladder filter
-  upgrade, key-tracking on the filter cutoff. See PLAN.md.
+- **Strings still feel synthy** even with vibrato. Most likely next
+  unlocks: (a) **unison/detune** — stack 2-3 oscillators per voice with
+  cents-level offsets and sum them, gives the "supersaw" thickness real
+  string sections have from many slightly-out-of-tune players; (b)
+  **amp tremolo** (LFO on amplitude — easy mirror of the vibrato code,
+  smaller payoff for strings); (c) **chorus effect** as a master
+  send/insert. Detune is the biggest payoff for the cost.
+- **Phase 8 starters**: portamento, 4-pole/ladder filter upgrade,
+  key-tracking on the filter cutoff. See PLAN.md.
 - **Velocity humanization**: small per-step timing / velocity jitter in
   the sequencer, addresses the "rigidly quantized" complaint without
   touching pattern files.

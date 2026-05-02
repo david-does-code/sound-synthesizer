@@ -211,6 +211,21 @@ pub fn render_to_wav(
     for (idx, amount) in collect_voice_property(pattern, &alloc, |t| t.sub) {
         voices[idx].set_sub(amount);
     }
+    // Vibrato: if either rate or depth is set on the track, apply both
+    // (filling unset side with a sensible default).
+    for section in &pattern.sections {
+        for track in &section.tracks {
+            if track.vibrato_rate.is_none() && track.vibrato_depth.is_none() {
+                continue;
+            }
+            let Some(va) = alloc.get(&track.name) else { continue };
+            let rate = track.vibrato_rate.unwrap_or(5.0);
+            let depth = track.vibrato_depth.unwrap_or(0.15);
+            for idx in va.base..va.base + va.slots {
+                voices[idx].set_vibrato(rate, depth);
+            }
+        }
+    }
 
     // Apply filter config (cutoff / resonance / env depth + filter ADSR)
     // for any track that has at least one filter property set. Falls back

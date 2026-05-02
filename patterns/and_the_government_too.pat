@@ -44,6 +44,17 @@ kick.gain: 0.7
 snare.gain: 0.5
 hihat.gain: 0.15
 
+# Lead vocal line - sine for clean pitch reference while transcribing.
+# Swap to filtered saw or pluck once the melody is locked in.
+lead.wave: sine
+lead.octave: 4
+lead.attack: 15ms
+lead.decay: 0.2
+lead.sustain: 0.7
+lead.release: 180ms
+lead.gain: 0.9
+lead.gate: 0.85
+
 # Each section: 64 steps = 8 bars at 8th-note grid (8 steps/bar)
 # Chord progression sits one chord per bar.
 
@@ -54,6 +65,7 @@ kick:  x-------x-------x-------x-------x-------x-------x-------x-------
 hihat: --o---o---o---o---o---o---o---o---o---o---o---o---o---o---o---o-
 pad:   Am . . . . . . . Em . . . . . . . F  . . . . . . . C  . . . . . . . F  . . . . . . . C  . . . . . . . G  . . . . . . . G  . . . . . . .
 bass:  A1 . . . . . . . E2 . . . . . . . F1 . . . . . . . C2 . . . . . . . F1 . . . . . . . C2 . . . . . . . G1 . . . . . . . G1 . . . . . . .
+lead:  . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
 
 [chorus]
 steps: 64
@@ -63,6 +75,7 @@ snare: --x---x---x---x---x---x---x---x---x---x---x---x---x---x---x---x-
 hihat: xoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxo
 pad:   F  . . . . . . . C  . . . . . . . F  . . . . . . . C  . . . . . . . F  . . . . . . . Am . . . . . . . G  . . . . . . . F  . . . . . . .
 bass:  F1 . . . . . . . C2 . . . . . . . F1 . . . . . . . C2 . . . . . . . F1 . . . . . . . A1 . . . . . . . G1 . . . . . . . F1 . . . . . . .
+lead:  . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
 
 [bridge]
 steps: 32
@@ -71,5 +84,6 @@ kick:  x-------x-------x-------x-------
 hihat: --o---o---o---o---o---o---o---o-
 pad:   Am . . . . . . . G  . . . . . . . F  . . . . . . . Am . . . . . . .
 bass:  A1 . . . . . . . G1 . . . . . . . F1 . . . . . . . A1 . . . . . . .
+lead:  . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
 
 song: verse chorus verse chorus bridge chorus

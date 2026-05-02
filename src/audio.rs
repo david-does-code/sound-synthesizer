@@ -305,6 +305,10 @@ pub struct EngineHandle {
     /// Pack: bit 63 = enabled, bits 32..63 hold brightness as f32 with sign
     /// stripped (we only need 0..1), bits 0..32 hold decay as f32.
     voice_pluck: Arc<[AtomicU64; MAX_VOICES]>,
+    /// Per-voice vibrato rate (Hz, f32 bits). 0.0 = off.
+    voice_vibrato_rate: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice vibrato depth (semitones, f32 bits). 0.0 = off.
+    voice_vibrato_depth: Arc<[AtomicU32; MAX_VOICES]>,
     sample_clock: Arc<AtomicU64>,
     /// Master reverb wet/dry mix as f32 bits. Read once per frame in the
     /// audio callback and pushed into the Reverb instance.
@@ -469,6 +473,17 @@ impl EngineHandle {
         }
     }
 
+    /// Configure per-voice pitch vibrato. `rate_hz` is typically 4-7 Hz;
+    /// `depth_semitones` is typically 0.05-0.3. Set depth to 0.0 to disable.
+    pub fn set_voice_vibrato(&self, voice_idx: usize, rate_hz: f32, depth_semitones: f32) {
+        if voice_idx < MAX_VOICES {
+            self.voice_vibrato_rate[voice_idx]
+                .store(rate_hz.max(0.0).to_bits(), Ordering::Relaxed);
+            self.voice_vibrato_depth[voice_idx]
+                .store(depth_semitones.max(0.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
     /// Enable / configure the Karplus-Strong pluck model on a voice.
     /// `decay` is the per-loop multiplier (typical 0.99–0.999); `brightness`
     /// is 0..1 (0.5 = textbook neutral).
@@ -535,6 +550,11 @@ pub struct Voice {
     /// the voice synthesizes from this instead of the oscillator + sub.
     pluck: KarplusStrong,
     pluck_enabled: bool,
+    /// Vibrato (pitch LFO). `vibrato_depth` is in semitones at the LFO peak;
+    /// 0.0 disables the modulation entirely (no per-sample sin call).
+    vibrato_rate: f32,
+    vibrato_depth: f32,
+    vibrato_phase: f32,
 }
 
 impl Voice {
@@ -567,7 +587,18 @@ impl Voice {
             // share an identical noise burst (which would phase-cancel).
             pluck: KarplusStrong::new(0xDEAD_BEEF),
             pluck_enabled: false,
+            vibrato_rate: 0.0,
+            vibrato_depth: 0.0,
+            vibrato_phase: 0.0,
         }
+    }
+
+    /// Configure pitch vibrato. `rate_hz` is the LFO frequency (typical 4-7 Hz),
+    /// `depth_semitones` is the peak deviation (typical 0.05-0.3). Set depth
+    /// to 0.0 to disable.
+    pub fn set_vibrato(&mut self, rate_hz: f32, depth_semitones: f32) {
+        self.vibrato_rate = rate_hz.max(0.0);
+        self.vibrato_depth = depth_semitones.max(0.0);
     }
 
     /// Enable / configure the Karplus-Strong pluck model for this voice.
@@ -684,13 +715,26 @@ impl Voice {
 
         value *= env_amp * self.velocity;
 
-        // Apply hammer-click pitch transient if active. Skip the math when
-        // the offset is essentially zero (the common case).
-        let effective_freq = if self.click_current.abs() > 0.001 {
-            // 2^(semitones/12), but exp2 is faster than powf.
-            let mult = (self.click_current / 12.0).exp2();
+        // Pitch modulation: combine hammer click + vibrato into a single
+        // multiplier on the base frequency. Both branches no-op when their
+        // amounts are essentially zero (the common case).
+        let mut semitone_offset = 0.0_f32;
+        if self.click_current.abs() > 0.001 {
+            semitone_offset += self.click_current;
             self.click_current *= self.click_decay;
-            self.frequency * mult
+        }
+        if self.vibrato_depth > 0.0 && self.vibrato_rate > 0.0 {
+            // Sine LFO; phase advances by rate / sample_rate per frame.
+            // Phase is *not* reset on note-on, so stacked voices with the
+            // same rate still naturally desync over a song.
+            semitone_offset += (self.vibrato_phase * TAU).sin() * self.vibrato_depth;
+            self.vibrato_phase += self.vibrato_rate / self.envelope.sample_rate();
+            if self.vibrato_phase >= 1.0 {
+                self.vibrato_phase -= 1.0;
+            }
+        }
+        let effective_freq = if semitone_offset.abs() > 0.0001 {
+            self.frequency * (semitone_offset / 12.0).exp2()
         } else {
             self.frequency
         };
@@ -781,6 +825,9 @@ pub struct AudioEngine {
     voice_filter_adsr: Arc<[AtomicU64; MAX_VOICES]>,
     /// Per-voice Karplus-Strong config (packed enable / decay / brightness).
     voice_pluck: Arc<[AtomicU64; MAX_VOICES]>,
+    /// Per-voice vibrato rate / depth (f32 bits). Both 0.0 = off.
+    voice_vibrato_rate: Arc<[AtomicU32; MAX_VOICES]>,
+    voice_vibrato_depth: Arc<[AtomicU32; MAX_VOICES]>,
     sample_rate: f32,
 }
 
@@ -901,6 +948,16 @@ impl AudioEngine {
             std::array::from_fn(|_| AtomicU64::new(0)),
         );
         let voice_pluck_clone = voice_pluck.clone();
+
+        // Per-voice vibrato (rate Hz + depth semitones, both f32 bits, default 0.0).
+        let voice_vibrato_rate: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+        );
+        let voice_vibrato_rate_clone = voice_vibrato_rate.clone();
+        let voice_vibrato_depth: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+        );
+        let voice_vibrato_depth_clone = voice_vibrato_depth.clone();
         let mut reverb = Reverb::new(0.0);
         // Distinct seeds so each noise drum has its own RNG stream.
         let mut drum_voices: [DrumVoice; NUM_DRUMS] = [
@@ -974,6 +1031,15 @@ impl AudioEngine {
                         let pluck_packed = voice_pluck_clone[i].load(Ordering::Relaxed);
                         let (enabled, decay, brightness) = unpack_pluck(pluck_packed);
                         voice.set_pluck(enabled, decay, brightness);
+
+                        // Vibrato (pitch LFO).
+                        let vrate = f32::from_bits(
+                            voice_vibrato_rate_clone[i].load(Ordering::Relaxed),
+                        );
+                        let vdepth = f32::from_bits(
+                            voice_vibrato_depth_clone[i].load(Ordering::Relaxed),
+                        );
+                        voice.set_vibrato(vrate, vdepth);
                     }
 
                     // Process commands from the main thread
@@ -1134,6 +1200,8 @@ impl AudioEngine {
             voice_filter_env,
             voice_filter_adsr,
             voice_pluck,
+            voice_vibrato_rate,
+            voice_vibrato_depth,
             sample_rate,
         }
     }
@@ -1156,6 +1224,8 @@ impl AudioEngine {
             voice_filter_env: self.voice_filter_env.clone(),
             voice_filter_adsr: self.voice_filter_adsr.clone(),
             voice_pluck: self.voice_pluck.clone(),
+            voice_vibrato_rate: self.voice_vibrato_rate.clone(),
+            voice_vibrato_depth: self.voice_vibrato_depth.clone(),
             sample_clock: self.sample_clock.clone(),
             reverb_mix: self.reverb_mix.clone(),
             sample_rate: self.sample_rate,

@@ -311,6 +311,25 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
         }
     }
 
+    /// Push per-track vibrato config to each voice in `range`. No-op when
+    /// the track has neither a rate nor a depth set.
+    fn apply_vibrato(
+        engine: &EngineHandle,
+        track: &crate::pattern::Track,
+        range: std::ops::Range<usize>,
+    ) {
+        if track.vibrato_rate.is_none() && track.vibrato_depth.is_none() {
+            return;
+        }
+        // If only one of the two is set, fall back to a sensible default for
+        // the other so the modulation actually does something.
+        let rate = track.vibrato_rate.unwrap_or(5.0);
+        let depth = track.vibrato_depth.unwrap_or(0.15);
+        for v in range {
+            engine.set_voice_vibrato(v, rate, depth);
+        }
+    }
+
     for section in &pattern.sections {
         for track in &section.tracks {
             match &track.kind {
@@ -350,6 +369,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     }
                     apply_filter(engine, track, next_voice..next_voice + 1);
                     apply_model(engine, track, next_voice..next_voice + 1);
+                    apply_vibrato(engine, track, next_voice..next_voice + 1);
                     alloc.insert(track.name.clone(), VoiceAlloc { base: next_voice, slots: 1 });
                     next_voice += 1;
                 }
@@ -407,6 +427,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     }
                     apply_filter(engine, track, next_voice..next_voice + chord_size);
                     apply_model(engine, track, next_voice..next_voice + chord_size);
+                    apply_vibrato(engine, track, next_voice..next_voice + chord_size);
                     alloc.insert(
                         track.name.clone(),
                         VoiceAlloc { base: next_voice, slots: chord_size },

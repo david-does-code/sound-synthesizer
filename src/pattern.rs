@@ -180,6 +180,12 @@ pub struct Track {
     /// Pluck brightness (0..1, 0.5 = textbook neutral, higher = ringy/bright).
     /// Only meaningful with `model: pluck`.
     pub pluck_brightness: Option<f32>,
+    /// Pitch vibrato rate in Hz (typical 4-7 Hz). `None` / 0 = off.
+    /// (`name.vibrato_rate: 5hz` or `name.vibrato_rate: 5`)
+    pub vibrato_rate: Option<f32>,
+    /// Pitch vibrato depth in semitones (typical 0.05-0.3). `None` / 0 = off.
+    /// (`name.vibrato_depth: 0.15`)
+    pub vibrato_depth: Option<f32>,
 }
 
 /// Which synthesis model a track uses. Default (when unset on a Track) is
@@ -306,7 +312,7 @@ impl fmt::Display for PatternParseError {
             ),
             Self::UnknownProperty { line, track, prop } => write!(
                 f,
-                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave, attack, decay, sustain, release, gain, gate, click, sub, cutoff, resonance, filter_env, filter_attack, filter_decay, filter_sustain, filter_release)"
+                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave, attack, decay, sustain, release, gain, gate, click, sub, cutoff, resonance, filter_env, filter_attack, filter_decay, filter_sustain, filter_release, model, pluck_decay, pluck_brightness, vibrato_rate, vibrato_depth)"
             ),
             Self::InvalidPropertyValue { line, track, prop, value } => write!(
                 f,
@@ -558,6 +564,8 @@ impl Pattern {
                         model: track_props.model,
                         pluck_decay: track_props.pluck_decay,
                         pluck_brightness: track_props.pluck_brightness,
+                        vibrato_rate: track_props.vibrato_rate,
+                        vibrato_depth: track_props.vibrato_depth,
                     });
                 }
             }
@@ -668,6 +676,8 @@ struct TrackProps {
     model: Option<SynthModel>,
     pluck_decay: Option<f32>,
     pluck_brightness: Option<f32>,
+    vibrato_rate: Option<f32>,
+    vibrato_depth: Option<f32>,
 }
 
 fn apply_property(
@@ -864,6 +874,28 @@ fn apply_property(
                 }
             })?;
             out.pluck_brightness = Some(b.clamp(0.0, 1.0));
+        }
+        "vibrato_rate" => {
+            let hz = parse_freq_value(value).ok_or_else(|| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.vibrato_rate = Some(hz.max(0.0));
+        }
+        "vibrato_depth" => {
+            let d: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.vibrato_depth = Some(d.max(0.0));
         }
         _ => {
             return Err(PatternParseError::UnknownProperty {
