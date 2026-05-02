@@ -36,27 +36,46 @@ const ALLPASS_DELAYS: [usize; 2] = [556, 441];
 const COMB_FEEDBACK: f32 = 0.84;
 /// Allpass coefficient — controls echo density / smoothness.
 const ALLPASS_GAIN: f32 = 0.5;
+/// One-pole lowpass damping inside each comb's feedback path. 0.0 = no
+/// damping (bright, metallic ring); 1.0 = full damping (no feedback at all).
+/// Real rooms absorb high frequencies faster than lows, so each echo bounce
+/// gets duller. Without this, a Schroeder reverb has the characteristic
+/// "hollow / metallic" sound. ~0.2 sounds like a small carpeted room.
+const COMB_DAMP: f32 = 0.2;
 
-/// One feedback comb filter. The simplest possible IIR reverb building block.
+/// One feedback comb filter with one-pole lowpass damping in the loop.
+///
+/// Without damping (`damp = 0`) this is the textbook Schroeder comb:
+/// `y[n] = x[n] + g · y[n − D]`. With damping, the fed-back delayed sample
+/// is first lowpassed by a one-pole IIR (`f[n] = (1 − d) · y[n − D] + d ·
+/// f[n − 1]`), so each successive echo is duller than the last — exactly
+/// what real rooms do, and what removes the metallic ring.
 struct Comb {
     buffer: Vec<f32>,
     index: usize,
     feedback: f32,
+    damp: f32,
+    /// One-pole lowpass state: previous filtered sample.
+    lp_state: f32,
 }
 
 impl Comb {
-    fn new(delay: usize, feedback: f32) -> Self {
+    fn new(delay: usize, feedback: f32, damp: f32) -> Self {
         Comb {
             buffer: vec![0.0; delay],
             index: 0,
             feedback,
+            damp,
+            lp_state: 0.0,
         }
     }
 
     fn process(&mut self, input: f32) -> f32 {
-        // Read the delayed sample, add the new input, write back, advance.
         let delayed = self.buffer[self.index];
-        let output = input + delayed * self.feedback;
+        // One-pole lowpass on the feedback path: lp_state slides toward
+        // `delayed` more sluggishly when damp is high.
+        self.lp_state = delayed * (1.0 - self.damp) + self.lp_state * self.damp;
+        let output = input + self.lp_state * self.feedback;
         self.buffer[self.index] = output;
         self.index = (self.index + 1) % self.buffer.len();
         delayed
@@ -112,7 +131,7 @@ impl Reverb {
     pub fn new(mix: f32) -> Self {
         let combs = COMB_DELAYS
             .iter()
-            .map(|&d| Comb::new(d, COMB_FEEDBACK))
+            .map(|&d| Comb::new(d, COMB_FEEDBACK, COMB_DAMP))
             .collect();
         let allpasses = ALLPASS_DELAYS
             .iter()
