@@ -1,1 +1,2 @@
 - [Concise commit messages](feedback_commit_messages.md) — keep commits short; subject-only when possible, body only for *why*
+- [AI music-theory claims need verification](feedback_ai_music_theory.md) — treat LLM meter / key / rhythm diagnoses as hypothesis, not fact

@@ -102,13 +102,30 @@ This is the foundation for making actual music.
 - [x] **Slice 5i — Per-section BPM**: `bpm:` inside a `[section]` header
       overrides the global tempo. Sequencer tracks absolute sample position
       with per-section step size instead of a single global rate.
+- [x] **Slice 5l — Export to WAV**: `cargo run -- --render <file.pat> <out.wav>`
+      renders one pass of the song through the offline renderer in
+      `src/render.rs`. Reuses the live engine's `Voice`/`DrumVoice` synthesis.
+
+**Sound-design improvements (added during 5l-era iteration):**
+- [x] **Hammer click** (`name.click: <semitones>`): per-note pitch transient
+      that decays in ~8ms — simulates a piano hammer's percussive attack.
+      Subtle: 2-3 semitones is musical, 12 is a chirp.
+- [x] **Sub-octave layer** (`name.sub: <amplitude>`): mixes a sine wave one
+      octave below each note. Adds body / warmth to thin synth leads.
+- [x] **Master reverb** (`reverb: <mix>` global header): Schroeder reverb
+      (4 damped combs + 2 allpass) in `src/reverb.rs`. Damping in the comb
+      feedback removes the metallic ring of the textbook design.
+- [x] **Hi-hat lowpass**: white noise was too sizzly; one-pole LP at ~9 kHz
+      tames the top end and a slightly slower decay (50→ from 70) gives body.
+- [x] **`steps_per_beat` global / per-section**: lets a section be triplets
+      (`steps_per_beat: 3`) or 32nds (`steps_per_beat: 8`) instead of the
+      default 16ths. Use sparingly — most songs are NOT in triplet meter.
 
 **Next slices (in build order):**
 - [ ] **Slice 5j — Visual grid in the TUI**: third UI mode (after piano/ADSR)
       showing the pattern grid with a moving playhead.
 - [ ] **Slice 5k — TUI editing**: toggle steps with arrow keys + space, save
       back to `.pat` files. Live-reload while playing.
-- [ ] **Slice 5l — Export pattern/song to WAV**: offline render.
 
 **Concepts learned so far**: tempo and BPM, beats and bars, 16th-note subdivisions
 in 4/4, drum kit anatomy (kick on the downbeat, snare on the backbeat, hi-hat

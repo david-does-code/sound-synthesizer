@@ -145,7 +145,8 @@ pub fn render_to_wav(
     let mut sections: Vec<ResolvedSection> = Vec::with_capacity(pattern.sections.len());
     for section in &pattern.sections {
         let section_bpm = section.bpm.unwrap_or(pattern.bpm);
-        let step_secs = 60.0 / section_bpm as f64 / 4.0;
+        let spb = section.steps_per_beat.unwrap_or(pattern.steps_per_beat);
+        let step_secs = 60.0 / section_bpm as f64 / spb as f64;
         let samples_per_step = (step_secs * SAMPLE_RATE as f64).round() as u64;
         let swing = section.swing.unwrap_or(pattern.swing);
 

@@ -396,10 +396,11 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                 }
             }
         }
-        // Per-section BPM: fall back to global.
+        // Per-section BPM and steps-per-beat: fall back to globals.
         let section_bpm = section.bpm.unwrap_or(pattern.bpm);
+        let spb = section.steps_per_beat.unwrap_or(pattern.steps_per_beat);
         let sample_rate = engine.sample_rate() as f64;
-        let step_secs = 60.0 / section_bpm as f64 / 4.0;
+        let step_secs = 60.0 / section_bpm as f64 / spb as f64;
         let samples_per_step = (step_secs * sample_rate).round() as u64;
 
         // Per-section swing: fall back to global.

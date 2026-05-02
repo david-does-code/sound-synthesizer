@@ -1,11 +1,16 @@
 # Coldplay — "Clocks"
 # Key: Eb major | BPM: 130 | Progression: Eb - Bbm - Fm
 #
-# The intro is JUST the piano riff, alone and exposed — that's the
-# iconic sound. Drums and bass enter later. The piano arpeggio
-# provides all the rhythmic drive, so drums stay minimal (no hi-hat
-# competing with the riff). Kick on 1, snare on 3 for a half-time
-# feel that lets the piano breathe.
+# The riff is 8th-note arpeggios in 4/4 (NOT triplets — a common
+# misdiagnosis). The 3-note cell Bb-G-Eb cycles every 3 eighth-notes
+# against the 4-beat bar, creating a 3-against-2 hemiola — that's
+# where the "polyrhythmic" feel comes from. On a 16-step grid, an
+# 8th note = every other step, so notes land on 0, 2, 4, 6, 8, 10,
+# 12, 14 with rests / sustains in between.
+#
+# The intro is JUST the piano riff — that's the iconic sound. Drums
+# and bass enter later. Kick on 1, snare on 3 for a half-time feel
+# that lets the piano breathe.
 
 bpm: 130
 steps: 16

@@ -94,6 +94,10 @@ pub struct Pattern {
     /// Reverb wet/dry mix (0.0–1.0). 0.0 = dry (default), ~0.2–0.3 = roomy.
     /// Applied to the master mix as a single send-style reverb.
     pub reverb: f32,
+    /// How many steps fit in one beat (a quarter note). Default 4 = 16th-note
+    /// grid (the standard step-sequencer default). Set to 3 for eighth-note
+    /// triplets, 6 for 16th-note triplets, 8 for 32nd notes, etc.
+    pub steps_per_beat: u32,
     pub sections: Vec<Section>,
     pub song: Vec<SongEntry>,
 }
@@ -107,6 +111,9 @@ pub struct Section {
     pub bpm: Option<u32>,
     /// Per-section swing override. `None` = inherit from global `Pattern.swing`.
     pub swing: Option<f32>,
+    /// Per-section steps-per-beat override. Lets one section be triplets and
+    /// another be 16ths within the same song.
+    pub steps_per_beat: Option<u32>,
     pub tracks: Vec<Track>,
 }
 
@@ -336,6 +343,7 @@ impl Pattern {
         let mut global_steps: Option<usize> = None;
         let mut global_swing: f32 = 0.0;
         let mut global_reverb: f32 = 0.0;
+        let mut global_steps_per_beat: u32 = 4;
         let mut sections: Vec<Section> = Vec::new();
         let mut song: Vec<SongEntry> = Vec::new();
 
@@ -363,6 +371,7 @@ impl Pattern {
                     steps: global_steps.unwrap_or(0),
                     bpm: None,
                     swing: None,
+                    steps_per_beat: None,
                     tracks: Vec::new(),
                 });
                 implicit_section = false;
@@ -447,6 +456,24 @@ impl Pattern {
                     })?;
                     global_reverb = r.clamp(0.0, 1.0);
                 }
+                "steps_per_beat" => {
+                    let n: u32 = parse_header_num(line_no, key, value)?;
+                    if n == 0 {
+                        return Err(PatternParseError::InvalidHeaderValue {
+                            line: line_no,
+                            key: key.to_string(),
+                            value: value.to_string(),
+                        });
+                    }
+                    if implicit_section || current.is_none() {
+                        global_steps_per_beat = n;
+                    }
+                    if let Some(ref mut sec) = current {
+                        if !implicit_section {
+                            sec.steps_per_beat = Some(n);
+                        }
+                    }
+                }
                 _ => {
                     // It's a track row. Make sure we have a section to put it in.
                     if current.is_none() && implicit_section {
@@ -455,6 +482,7 @@ impl Pattern {
                             steps: global_steps.unwrap_or(0),
                             bpm: None,
                             swing: None,
+                            steps_per_beat: None,
                             tracks: Vec::new(),
                         });
                     }
@@ -525,6 +553,7 @@ impl Pattern {
             bpm: bpm.ok_or(PatternParseError::MissingHeader("bpm"))?,
             swing: global_swing,
             reverb: global_reverb,
+            steps_per_beat: global_steps_per_beat,
             sections,
             song,
         })

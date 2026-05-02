@@ -19,18 +19,25 @@ See PLAN.md for the roadmap and current progress.
   target-sample + velocity for sample-accurate drum triggers), `voice_events`
   (`[AtomicU64; 8]` packed (kind, velocity, midi, sample) for sample-accurate note
   scheduling), and `sample_clock` (`AtomicU64`, advanced per-frame by the callback).
-  Each voice and drum carries a velocity field set on trigger. Contains `Waveform`,
-  `Drum`, `DrumVoice`, and `EngineHandle` — a clonable Send + Sync control surface
-  used by the sequencer to schedule drums + pitched notes and to set per-voice
-  waveforms, ADSR, and gain.
+  Each voice and drum carries a velocity field set on trigger. Sound-design
+  extensions: per-voice `voice_click` (`[AtomicU32; 8]`, semitones of pitch
+  transient on note-on) and `voice_sub` (`[AtomicU32; 8]`, sub-octave sine
+  layer amplitude); master `reverb_mix` (`AtomicU32`) drives a single
+  Schroeder reverb on the final mix. Contains `Waveform`, `Drum`, `Voice`
+  (now `pub` so the offline renderer reuses it), `DrumVoice`, and
+  `EngineHandle` — a clonable Send + Sync control surface used by the
+  sequencer to schedule drums + pitched notes and to set per-voice
+  waveforms, ADSR, gain, click, sub, and master reverb.
 - `src/envelope.rs` — ADSR envelope generator. Per-sample state machine (Idle → Attack →
   Decay → Sustain → Release → Idle). Lives inside the audio callback closure.
 - `src/keyboard.rs` — Reads raw keyboard events from Linux evdev (`/dev/input/`).
   Sends note, waveform, octave, mode toggle, and arrow key events over an MPSC channel.
 - `src/pattern.rs` — Pattern file format and parser. Defines `Pattern` (with `bpm`,
-  `swing`, `sections: Vec<Section>`, `song: Vec<SongEntry>`), `Section` (with `name`,
-  `steps`, optional `bpm`/`swing` overrides, `tracks`), `Track` (with optional `wave`,
-  `attack`/`decay`/`sustain`/`release`, `gain`, `gate` properties), `TrackKind`
+  `swing`, `reverb`, `steps_per_beat`, `sections: Vec<Section>`, `song: Vec<SongEntry>`),
+  `Section` (with `name`, `steps`, optional `bpm`/`swing`/`steps_per_beat`
+  overrides, `tracks`), `Track` (with optional `wave`,
+  `attack`/`decay`/`sustain`/`release`, `gain`, `gate`, `click`, `sub` properties),
+  `TrackKind`
   (`Drum(Vec<f32>)` velocities / `Notes(Vec<Cell>)` / `Chord(Vec<ChordCell>)`), `Cell`
   (`Rest | Sustain | Note(u8, f32)` with velocity) and `ChordCell` (`Rest | Sustain |
   Chord(Vec<(u8, f32)>)`), and `PatternParseError`. Format: `bpm:`/`steps:`/`swing:`
@@ -63,6 +70,16 @@ See PLAN.md for the roadmap and current progress.
   pass of the song to a 16-bit mono 44.1 kHz WAV (uses the offline renderer in
   `src/render.rs`). `--help` lists usage. To listen to a rendered WAV, use a
   system player: `mpv out.wav` (preferred), or `aplay`/`paplay`.
+- `src/render.rs` — Offline (non-realtime) WAV renderer. Walks one pass of
+  the pattern's song chain and synthesizes samples using the same `Voice` /
+  `DrumVoice` primitives as the live engine, then runs the buffer through
+  the master `Reverb`. Single-threaded, so it skips the atomic plumbing
+  and applies events directly. Output is 16-bit mono 44.1 kHz.
+- `src/reverb.rs` — Schroeder reverb (4 parallel feedback comb filters with
+  one-pole lowpass damping in the loop, then 2 series allpass filters).
+  Damping kills the metallic ring of the textbook design and produces a
+  warmer, more natural room sound. Used by both the live audio callback
+  and the offline renderer.
 - `src/visualizer.rs` — Renders waveforms and ADSR envelopes using Unicode braille characters
   (2×4 dot grid per character). Shared `render_braille` function for both.
 - `src/notes.rs` — Keyboard layout diagram.
@@ -118,10 +135,28 @@ See PLAN.md for the roadmap and current progress.
 
 ## What's Next
 
-Check PLAN.md — Phases 1-4 are complete. Phase 5 (sequencer + composition) is in
-progress. Done: parser, drum synthesis, sequencer engine, sample-accurate timing,
-melodic note tracks, per-track instruments (5a), chord shorthand (5b), song
-structure with sections + song chains (5c), per-track ADSR (5d), per-track
-volume/mixing (5e), velocity/dynamics (5f), note gate length (5g), swing/shuffle
-(5h), per-section BPM (5i). Next up: TUI grid view + editor (5j-5k), then
-WAV export (5l).
+Phases 1-4 done. Phase 5 mostly done: parser, drums, sequencer with
+sample-accurate timing, melodic notes (5a), chord shorthand (5b), song
+sections + chains (5c), per-track ADSR (5d), volume/mixing (5e),
+velocity (5f), gate (5g), swing (5h), per-section BPM (5i), and **WAV
+export (5l)** — `cargo run -- --render in.pat out.wav`.
+
+Sound-design layer added on top of 5l: hammer click (`name.click`),
+sub-octave layer (`name.sub`), master reverb (`reverb:` global header),
+hi-hat lowpass, and `steps_per_beat` for non-16th-grid songs.
+
+**Pick next session by mood:**
+- **5j + 5k**: TUI grid view + live step editing. Biggest composition
+  unlock — turns the iteration loop from "edit-render-listen" into live.
+- **Phase 8 starters**: LFO + vibrato, filter + filter envelope (biggest
+  missing sound-design tool), portamento. See PLAN.md.
+- **Velocity humanization**: small per-step timing / velocity jitter in
+  the sequencer, addresses the "rigidly quantized" complaint without
+  touching pattern files.
+- **More songs**: transcribe something other than Clocks — the engine
+  has enough to compose with now.
+
+**Feedback-loop note**: Gemini audio analysis (`tools/video` with
+`audio/wav`) is useful for sound-design diagnosis (thin tone, no space,
+missing attack) but unreliable for rhythm / meter / key claims —
+treat those as hypotheses (see `.claude/memories/feedback_ai_music_theory.md`).
