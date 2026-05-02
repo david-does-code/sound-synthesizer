@@ -156,6 +156,21 @@ pub struct Track {
     /// sine wave one octave below each note at this amplitude (0.0–1.0).
     /// Adds body / warmth to thin synth leads. (`name.sub: 0.3`)
     pub sub: Option<f32>,
+    /// Resonant lowpass filter base cutoff in Hz. `None` = bypassed.
+    /// Accepts `800`, `800Hz`, or `1.2kHz`. (`name.cutoff: 800Hz`)
+    pub cutoff: Option<f32>,
+    /// Filter resonance, 0.0..0.97. Higher = more peaky around the cutoff.
+    /// (`name.resonance: 0.4`)
+    pub resonance: Option<f32>,
+    /// Filter envelope depth in octaves. The cutoff sweeps upward by this
+    /// many octaves at envelope peak. (`name.filter_env: 3.0`)
+    pub filter_env: Option<f32>,
+    /// Optional filter ADSR overrides. If unset, the filter env follows the
+    /// amp ADSR — adequate for most pluck/wah sounds.
+    pub filter_attack: Option<f32>,
+    pub filter_decay: Option<f32>,
+    pub filter_sustain: Option<f32>,
+    pub filter_release: Option<f32>,
 }
 
 /// What this track plays.
@@ -275,7 +290,7 @@ impl fmt::Display for PatternParseError {
             ),
             Self::UnknownProperty { line, track, prop } => write!(
                 f,
-                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave, attack, decay, sustain, release, gain, gate)"
+                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave, attack, decay, sustain, release, gain, gate, click, sub, cutoff, resonance, filter_env, filter_attack, filter_decay, filter_sustain, filter_release)"
             ),
             Self::InvalidPropertyValue { line, track, prop, value } => write!(
                 f,
@@ -517,6 +532,13 @@ impl Pattern {
                         gate: track_props.gate,
                         click: track_props.click,
                         sub: track_props.sub,
+                        cutoff: track_props.cutoff,
+                        resonance: track_props.resonance,
+                        filter_env: track_props.filter_env,
+                        filter_attack: track_props.filter_attack,
+                        filter_decay: track_props.filter_decay,
+                        filter_sustain: track_props.filter_sustain,
+                        filter_release: track_props.filter_release,
                     });
                 }
             }
@@ -617,6 +639,13 @@ struct TrackProps {
     gate: Option<f32>,
     click: Option<f32>,
     sub: Option<f32>,
+    cutoff: Option<f32>,
+    resonance: Option<f32>,
+    filter_env: Option<f32>,
+    filter_attack: Option<f32>,
+    filter_decay: Option<f32>,
+    filter_sustain: Option<f32>,
+    filter_release: Option<f32>,
 }
 
 fn apply_property(
@@ -719,6 +748,65 @@ fn apply_property(
             })?;
             out.sub = Some(s.clamp(0.0, 1.0));
         }
+        "cutoff" => {
+            let hz = parse_freq_value(value).ok_or_else(|| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.cutoff = Some(hz.max(10.0));
+        }
+        "resonance" => {
+            let r: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.resonance = Some(r.clamp(0.0, 0.97));
+        }
+        "filter_env" => {
+            let oct: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.filter_env = Some(oct);
+        }
+        "filter_attack" | "filter_decay" | "filter_release" => {
+            let secs = parse_time_value(value).ok_or_else(|| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            match prop {
+                "filter_attack" => out.filter_attack = Some(secs),
+                "filter_decay" => out.filter_decay = Some(secs),
+                _ => out.filter_release = Some(secs),
+            }
+        }
+        "filter_sustain" => {
+            let level: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.filter_sustain = Some(level.clamp(0.0, 1.0));
+        }
         _ => {
             return Err(PatternParseError::UnknownProperty {
                 line: line_no,
@@ -736,6 +824,20 @@ fn parse_time_value(s: &str) -> Option<f32> {
     if let Some(ms_str) = s.strip_suffix("ms") {
         let ms: f32 = ms_str.trim().parse().ok()?;
         Some(ms / 1000.0)
+    } else {
+        s.parse::<f32>().ok()
+    }
+}
+
+/// Parse a frequency value: bare number is Hz (`800`), `Hz`/`hz` suffix is
+/// also Hz, `kHz`/`khz` suffix is kilohertz. Returns Hz.
+fn parse_freq_value(s: &str) -> Option<f32> {
+    let s = s.trim();
+    let lower = s.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_suffix("khz") {
+        rest.trim().parse::<f32>().ok().map(|v| v * 1000.0)
+    } else if let Some(rest) = lower.strip_suffix("hz") {
+        rest.trim().parse::<f32>().ok()
     } else {
         s.parse::<f32>().ok()
     }

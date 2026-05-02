@@ -22,21 +22,32 @@ See PLAN.md for the roadmap and current progress.
   Each voice and drum carries a velocity field set on trigger. Sound-design
   extensions: per-voice `voice_click` (`[AtomicU32; 8]`, semitones of pitch
   transient on note-on) and `voice_sub` (`[AtomicU32; 8]`, sub-octave sine
-  layer amplitude); master `reverb_mix` (`AtomicU32`) drives a single
+  layer amplitude); per-voice resonant lowpass filter via
+  `voice_cutoff`/`voice_resonance`/`voice_filter_env` (`[AtomicU32; 8]`
+  each, defaults bypassed) plus `voice_filter_adsr` (`[AtomicU64; 8]`,
+  0 = follow amp ADSR); master `reverb_mix` (`AtomicU32`) drives a single
   Schroeder reverb on the final mix. Contains `Waveform`, `Drum`, `Voice`
-  (now `pub` so the offline renderer reuses it), `DrumVoice`, and
-  `EngineHandle` — a clonable Send + Sync control surface used by the
-  sequencer to schedule drums + pitched notes and to set per-voice
-  waveforms, ADSR, gain, click, sub, and master reverb.
+  (now `pub` so the offline renderer reuses it; carries an `SvfLowpass`
+  + filter envelope), `DrumVoice`, and `EngineHandle` — a clonable
+  Send + Sync control surface used by the sequencer to schedule drums +
+  pitched notes and to set per-voice waveforms, ADSR, gain, click, sub,
+  filter, filter ADSR, and master reverb.
 - `src/envelope.rs` — ADSR envelope generator. Per-sample state machine (Idle → Attack →
   Decay → Sustain → Release → Idle). Lives inside the audio callback closure.
+- `src/filter.rs` — TPT state-variable lowpass (2-pole, 12 dB/oct,
+  Andrew Simper topology). Per-voice resonant LPF with envelope-modulated
+  cutoff; bypassed by default (cutoff 20 kHz, env depth 0) so voices that
+  don't ask for one pay zero per-sample cost. Cutoff modulation is
+  exponential — `cutoff = base * 2^(env * env_octaves)`.
 - `src/keyboard.rs` — Reads raw keyboard events from Linux evdev (`/dev/input/`).
   Sends note, waveform, octave, mode toggle, and arrow key events over an MPSC channel.
 - `src/pattern.rs` — Pattern file format and parser. Defines `Pattern` (with `bpm`,
   `swing`, `reverb`, `steps_per_beat`, `sections: Vec<Section>`, `song: Vec<SongEntry>`),
   `Section` (with `name`, `steps`, optional `bpm`/`swing`/`steps_per_beat`
   overrides, `tracks`), `Track` (with optional `wave`,
-  `attack`/`decay`/`sustain`/`release`, `gain`, `gate`, `click`, `sub` properties),
+  `attack`/`decay`/`sustain`/`release`, `gain`, `gate`, `click`, `sub`,
+  `cutoff`/`resonance`/`filter_env` and `filter_attack`/`filter_decay`/
+  `filter_sustain`/`filter_release` properties),
   `TrackKind`
   (`Drum(Vec<f32>)` velocities / `Notes(Vec<Cell>)` / `Chord(Vec<ChordCell>)`), `Cell`
   (`Rest | Sustain | Note(u8, f32)` with velocity) and `ChordCell` (`Rest | Sustain |
@@ -143,13 +154,16 @@ export (5l)** — `cargo run -- --render in.pat out.wav`.
 
 Sound-design layer added on top of 5l: hammer click (`name.click`),
 sub-octave layer (`name.sub`), master reverb (`reverb:` global header),
-hi-hat lowpass, and `steps_per_beat` for non-16th-grid songs.
+hi-hat lowpass, `steps_per_beat` for non-16th-grid songs, and
+**resonant lowpass + filter envelope** (`name.cutoff`, `name.resonance`,
+`name.filter_env`, plus optional `name.filter_attack/decay/sustain/release`
+falling back to amp ADSR).
 
 **Pick next session by mood:**
 - **5j + 5k**: TUI grid view + live step editing. Biggest composition
   unlock — turns the iteration loop from "edit-render-listen" into live.
-- **Phase 8 starters**: LFO + vibrato, filter + filter envelope (biggest
-  missing sound-design tool), portamento. See PLAN.md.
+- **Phase 8 starters**: LFO + vibrato, portamento, 4-pole/ladder filter
+  upgrade, key-tracking on the filter cutoff. See PLAN.md.
 - **Velocity humanization**: small per-step timing / velocity jitter in
   the sequencer, addresses the "rigidly quantized" complaint without
   touching pattern files.

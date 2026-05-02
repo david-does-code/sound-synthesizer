@@ -211,6 +211,11 @@ pub fn render_to_wav(
     for (idx, amount) in collect_voice_property(pattern, &alloc, |t| t.sub) {
         voices[idx].set_sub(amount);
     }
+
+    // Apply filter config (cutoff / resonance / env depth + filter ADSR)
+    // for any track that has at least one filter property set. Falls back
+    // to amp ADSR for any unspecified filter envelope params.
+    apply_filter_settings(pattern, &alloc, &voice_adsr, &mut voices);
     let mut drums: [DrumVoice; NUM_DRUMS] = [
         DrumVoice::new(Drum::Kick, SAMPLE_RATE, 0x1234_5678),
         DrumVoice::new(Drum::Snare, SAMPLE_RATE, 0x9E37_79B9),
@@ -482,6 +487,47 @@ where
         }
     }
     out
+}
+
+/// Push filter config from each track onto its allocated voices, mirroring
+/// the live-engine path in `sequencer::pre_resolve`. Any track with at least
+/// one filter property gets a filter; other tracks stay bypassed.
+fn apply_filter_settings(
+    pattern: &Pattern,
+    alloc: &HashMap<String, VoiceAlloc>,
+    voice_adsr: &[AdsrParams; MAX_VOICES],
+    voices: &mut [Voice],
+) {
+    let mut applied: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for section in &pattern.sections {
+        for track in &section.tracks {
+            let any_filter = track.cutoff.is_some()
+                || track.resonance.is_some()
+                || track.filter_env.is_some();
+            if !any_filter {
+                continue;
+            }
+            let Some(va) = alloc.get(&track.name) else { continue };
+            let cutoff = track.cutoff.unwrap_or(20_000.0);
+            let resonance = track.resonance.unwrap_or(0.0);
+            let env_oct = track.filter_env.unwrap_or(0.0);
+            for s in 0..va.slots {
+                let idx = va.base + s;
+                if !applied.insert(idx) {
+                    continue;
+                }
+                let amp = voice_adsr[idx];
+                let filter_adsr = AdsrParams {
+                    attack: track.filter_attack.unwrap_or(amp.attack),
+                    decay: track.filter_decay.unwrap_or(amp.decay),
+                    sustain: track.filter_sustain.unwrap_or(amp.sustain),
+                    release: track.filter_release.unwrap_or(amp.release),
+                };
+                voices[idx].set_filter(cutoff, resonance, env_oct);
+                voices[idx].filter_env.set_params(filter_adsr);
+            }
+        }
+    }
 }
 
 fn max_chord_size(cells: &[ChordCell]) -> usize {

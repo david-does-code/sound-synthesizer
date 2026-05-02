@@ -1,4 +1,5 @@
 use crate::envelope::{AdsrParams, Envelope};
+use crate::filter::SvfLowpass;
 use crate::reverb::Reverb;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::f32::consts::TAU;
@@ -290,6 +291,14 @@ pub struct EngineHandle {
     /// Per-voice sub-octave sine layer amplitude (f32 bits). 0.0 = off.
     voice_sub: Arc<[AtomicU32; MAX_VOICES]>,
     drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
+    /// Per-voice base cutoff (f32 Hz bits). Default 20000.0.
+    voice_cutoff: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice resonance (f32 0..0.97 bits). Default 0.0.
+    voice_resonance: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice filter env depth in octaves (f32 bits). Default 0.0.
+    voice_filter_env: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice filter ADSR (packed same as voice_adsr; 0 = use amp ADSR).
+    voice_filter_adsr: Arc<[AtomicU64; MAX_VOICES]>,
     sample_clock: Arc<AtomicU64>,
     /// Master reverb wet/dry mix as f32 bits. Read once per frame in the
     /// audio callback and pushed into the Reverb instance.
@@ -409,6 +418,33 @@ impl EngineHandle {
     pub fn set_reverb_mix(&self, mix: f32) {
         self.reverb_mix.store(mix.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
+
+    /// Configure the per-voice resonant lowpass filter.
+    ///
+    /// `cutoff_hz` is the base cutoff (default 20000 = effectively bypassed).
+    /// `resonance` is 0..0.97. `env_octaves` is the upward sweep depth from
+    /// the filter envelope (positive opens the filter on attack).
+    pub fn set_voice_filter(
+        &self,
+        voice_idx: usize,
+        cutoff_hz: f32,
+        resonance: f32,
+        env_octaves: f32,
+    ) {
+        if voice_idx < MAX_VOICES {
+            self.voice_cutoff[voice_idx].store(cutoff_hz.to_bits(), Ordering::Relaxed);
+            self.voice_resonance[voice_idx]
+                .store(resonance.clamp(0.0, 0.97).to_bits(), Ordering::Relaxed);
+            self.voice_filter_env[voice_idx].store(env_octaves.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Set the per-voice filter envelope (separate from amp envelope).
+    pub fn set_voice_filter_adsr(&self, voice_idx: usize, params: AdsrParams) {
+        if voice_idx < MAX_VOICES {
+            self.voice_filter_adsr[voice_idx].store(pack_adsr(&params), Ordering::Relaxed);
+        }
+    }
 }
 
 /// State for a single voice inside the audio callback.
@@ -443,6 +479,25 @@ pub struct Voice {
     sub_amount: f32,
     /// Independent phase accumulator for the sub-octave sine. Reset on trigger.
     sub_phase: f32,
+    /// Resonant lowpass filter (post amp envelope, post sub mix). Bypassed
+    /// entirely when `filter_enabled == false` to avoid the per-sample tan().
+    filter: SvfLowpass,
+    /// Second ADSR envelope that modulates the filter cutoff. Independent of
+    /// the amp envelope so attack-bite plucks etc. are possible.
+    pub filter_env: Envelope,
+    /// Cached packed filter ADSR for change detection.
+    last_filter_adsr: u64,
+    /// Base cutoff in Hz. Modulated upward by `filter_env` × `filter_env_octaves`.
+    base_cutoff_hz: f32,
+    /// Filter resonance (0..0.97).
+    filter_resonance: f32,
+    /// Envelope depth in octaves. Cutoff = base * 2^(env_value * depth).
+    /// Positive values sweep upward (the typical pluck/wah motion).
+    filter_env_octaves: f32,
+    /// True when the filter actually has work to do (cutoff < ~18 kHz or
+    /// non-trivial env modulation). Lets us short-circuit the filter math
+    /// for voices that don't use one.
+    filter_enabled: bool,
 }
 
 impl Voice {
@@ -464,7 +519,26 @@ impl Voice {
             click_decay: decay,
             sub_amount: 0.0,
             sub_phase: 0.0,
+            filter: SvfLowpass::new(),
+            filter_env: Envelope::new(sample_rate),
+            last_filter_adsr: 0,
+            base_cutoff_hz: 20_000.0,
+            filter_resonance: 0.0,
+            filter_env_octaves: 0.0,
+            filter_enabled: false,
         }
+    }
+
+    /// Configure the resonant lowpass filter.
+    ///
+    /// The filter is bypassed when `cutoff_hz >= 18_000.0` and `env_octaves`
+    /// is essentially zero — we use that pair as the "no filter" sentinel so
+    /// existing patterns that don't mention a filter pay zero per-sample cost.
+    pub fn set_filter(&mut self, cutoff_hz: f32, resonance: f32, env_octaves: f32) {
+        self.base_cutoff_hz = cutoff_hz;
+        self.filter_resonance = resonance;
+        self.filter_env_octaves = env_octaves;
+        self.filter_enabled = cutoff_hz < 18_000.0 || env_octaves.abs() > 0.001;
     }
 
     /// Configure the per-note pitch transient ("hammer click"). On every
@@ -488,12 +562,18 @@ impl Voice {
         self.velocity = velocity;
         self.active = true;
         self.envelope.gate_on();
+        if self.filter_enabled {
+            self.filter_env.gate_on();
+        }
         self.click_current = self.click_initial;
     }
 
     /// Release the note (gate-off), entering the release phase.
     pub fn release(&mut self) {
         self.envelope.gate_off();
+        if self.filter_enabled {
+            self.filter_env.gate_off();
+        }
         self.gate_remaining = 0;
     }
 
@@ -541,6 +621,22 @@ impl Voice {
         self.phase += effective_freq / self.envelope.sample_rate();
         if self.phase >= 1.0 {
             self.phase -= 1.0;
+        }
+
+        // Resonant lowpass with envelope-modulated cutoff. The default state
+        // (cutoff ≈ 20 kHz, no env depth) sets `filter_enabled = false`, so
+        // patterns without a filter property skip this branch entirely and
+        // produce sample-identical output to before this feature existed.
+        if self.filter_enabled {
+            let env = self.filter_env.next_sample();
+            // Exponential modulation: each unit of env_octaves doubles the cutoff.
+            let cutoff = self.base_cutoff_hz * (env * self.filter_env_octaves).exp2();
+            value = self.filter.process(
+                value,
+                cutoff,
+                self.filter_resonance,
+                self.envelope.sample_rate(),
+            );
         }
 
         value
@@ -598,6 +694,14 @@ pub struct AudioEngine {
     /// Master reverb wet/dry mix as f32 bits. Lives outside the callback so
     /// the sequencer / main thread can change it lock-free.
     reverb_mix: Arc<AtomicU32>,
+    /// Per-voice filter parameters (cutoff Hz, resonance, env depth in octaves).
+    /// f32 bits stored as u32. Defaults: 20000.0 / 0.0 / 0.0 (filter bypassed).
+    voice_cutoff: Arc<[AtomicU32; MAX_VOICES]>,
+    voice_resonance: Arc<[AtomicU32; MAX_VOICES]>,
+    voice_filter_env: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice filter ADSR (packed). 0 = use amp ADSR (set explicitly when
+    /// the sequencer pushes per-track filter envelopes).
+    voice_filter_adsr: Arc<[AtomicU64; MAX_VOICES]>,
     sample_rate: f32,
 }
 
@@ -691,6 +795,27 @@ impl AudioEngine {
 
         let reverb_mix = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let reverb_mix_clone = reverb_mix.clone();
+
+        // Per-voice filter params, defaulted to "bypassed" so any voice that
+        // never gets a filter set does no extra DSP work.
+        let voice_cutoff: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(20_000.0_f32.to_bits())),
+        );
+        let voice_cutoff_clone = voice_cutoff.clone();
+        let voice_resonance: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+        );
+        let voice_resonance_clone = voice_resonance.clone();
+        let voice_filter_env: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+        );
+        let voice_filter_env_clone = voice_filter_env.clone();
+        // Per-voice filter ADSR: 0 = "follow amp ADSR" (sequencer pushes the
+        // resolved fallback when needed).
+        let voice_filter_adsr: Arc<[AtomicU64; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU64::new(0)),
+        );
+        let voice_filter_adsr_clone = voice_filter_adsr.clone();
         let mut reverb = Reverb::new(0.0);
         // Distinct seeds so each noise drum has its own RNG stream.
         let mut drum_voices: [DrumVoice; NUM_DRUMS] = [
@@ -732,6 +857,32 @@ impl AudioEngine {
                         if voice.last_adsr != effective {
                             voice.envelope.set_params(unpack_adsr(effective));
                             voice.last_adsr = effective;
+                        }
+                    }
+
+                    // Per-voice filter params and filter ADSR. Cheap atomics —
+                    // load once per buffer and push into the voice. The voice
+                    // sets `filter_enabled` based on the values, so a voice
+                    // that never gets a filter does no per-sample filter work.
+                    for (i, voice) in voices.iter_mut().enumerate() {
+                        let cutoff = f32::from_bits(
+                            voice_cutoff_clone[i].load(Ordering::Relaxed),
+                        );
+                        let res = f32::from_bits(
+                            voice_resonance_clone[i].load(Ordering::Relaxed),
+                        );
+                        let env = f32::from_bits(
+                            voice_filter_env_clone[i].load(Ordering::Relaxed),
+                        );
+                        voice.set_filter(cutoff, res, env);
+
+                        // Filter ADSR: 0 sentinel means "follow amp envelope"
+                        // — copy the amp ADSR into the filter env in that case.
+                        let f_adsr = voice_filter_adsr_clone[i].load(Ordering::Relaxed);
+                        let effective_f = if f_adsr != 0 { f_adsr } else { voice.last_adsr };
+                        if voice.last_filter_adsr != effective_f && effective_f != 0 {
+                            voice.filter_env.set_params(unpack_adsr(effective_f));
+                            voice.last_filter_adsr = effective_f;
                         }
                     }
 
@@ -888,6 +1039,10 @@ impl AudioEngine {
             voice_events,
             sample_clock,
             reverb_mix,
+            voice_cutoff,
+            voice_resonance,
+            voice_filter_env,
+            voice_filter_adsr,
             sample_rate,
         }
     }
@@ -905,6 +1060,10 @@ impl AudioEngine {
             voice_click: self.voice_click.clone(),
             voice_sub: self.voice_sub.clone(),
             drum_gains: self.drum_gains.clone(),
+            voice_cutoff: self.voice_cutoff.clone(),
+            voice_resonance: self.voice_resonance.clone(),
+            voice_filter_env: self.voice_filter_env.clone(),
+            voice_filter_adsr: self.voice_filter_adsr.clone(),
             sample_clock: self.sample_clock.clone(),
             reverb_mix: self.reverb_mix.clone(),
             sample_rate: self.sample_rate,

@@ -255,6 +255,48 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
         })
     }
 
+    /// Resolve effective amp ADSR (with global defaults) for a track, used
+    /// as the fallback when the filter envelope properties aren't all set.
+    fn resolved_amp_adsr(track: &crate::pattern::Track) -> AdsrParams {
+        let def = AdsrParams::default();
+        AdsrParams {
+            attack: track.attack.unwrap_or(def.attack),
+            decay: track.decay.unwrap_or(def.decay),
+            sustain: track.sustain.unwrap_or(def.sustain),
+            release: track.release.unwrap_or(def.release),
+        }
+    }
+
+    /// Push per-track filter config (cutoff, resonance, env depth, ADSR) onto
+    /// each voice in `range`. No-op when the track has no filter properties.
+    fn apply_filter(
+        engine: &EngineHandle,
+        track: &crate::pattern::Track,
+        range: std::ops::Range<usize>,
+    ) {
+        let any_filter = track.cutoff.is_some()
+            || track.resonance.is_some()
+            || track.filter_env.is_some();
+        if !any_filter {
+            return;
+        }
+        let cutoff = track.cutoff.unwrap_or(20_000.0);
+        let resonance = track.resonance.unwrap_or(0.0);
+        let env_oct = track.filter_env.unwrap_or(0.0);
+
+        let amp = resolved_amp_adsr(track);
+        let filter_adsr = AdsrParams {
+            attack: track.filter_attack.unwrap_or(amp.attack),
+            decay: track.filter_decay.unwrap_or(amp.decay),
+            sustain: track.filter_sustain.unwrap_or(amp.sustain),
+            release: track.filter_release.unwrap_or(amp.release),
+        };
+        for v in range {
+            engine.set_voice_filter(v, cutoff, resonance, env_oct);
+            engine.set_voice_filter_adsr(v, filter_adsr);
+        }
+    }
+
     for section in &pattern.sections {
         for track in &section.tracks {
             match &track.kind {
@@ -292,6 +334,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     if let Some(sub) = track.sub {
                         engine.set_voice_sub(next_voice, sub);
                     }
+                    apply_filter(engine, track, next_voice..next_voice + 1);
                     alloc.insert(track.name.clone(), VoiceAlloc { base: next_voice, slots: 1 });
                     next_voice += 1;
                 }
@@ -347,6 +390,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                             engine.set_voice_sub(v, sub);
                         }
                     }
+                    apply_filter(engine, track, next_voice..next_voice + chord_size);
                     alloc.insert(
                         track.name.clone(),
                         VoiceAlloc { base: next_voice, slots: chord_size },

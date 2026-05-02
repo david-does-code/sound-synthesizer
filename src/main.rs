@@ -1,5 +1,6 @@
 mod audio;
 mod envelope;
+mod filter;
 mod keyboard;
 mod notes;
 mod pattern;
