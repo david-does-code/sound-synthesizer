@@ -168,6 +168,16 @@ falling back to amp ADSR), and **Karplus-Strong pluck synthesis**
 for plucked-string tones the oscillator can't reach.
 
 **Pick next session by mood:**
+- **Add a lead line to atgt** (in progress — pipeline set up, melody not
+  yet transcribed). The Zucker cover (`patterns/and_the_government_too.pat`)
+  has chords + bass + drums + plucked-string pad. Vocal stem already
+  extracted to disk via yt-dlp + demucs (see "Vocal extraction pipeline"
+  below) — the next session should run `basic-pitch` on the stem (or
+  transcribe by ear) to get the topline, then add it as a `lead` track
+  in the existing pattern. Try sine first (clean), then filtered saw,
+  then pluck — and consider a second user-composed lead variant in
+  parallel since both `(a) faithful` and `(b) original` lead options
+  were left on the table.
 - **5j + 5k**: TUI grid view + live step editing. Biggest composition
   unlock — turns the iteration loop from "edit-render-listen" into live.
 - **Phase 8 starters**: LFO + vibrato, portamento, 4-pole/ladder filter
@@ -175,8 +185,43 @@ for plucked-string tones the oscillator can't reach.
 - **Velocity humanization**: small per-step timing / velocity jitter in
   the sequencer, addresses the "rigidly quantized" complaint without
   touching pattern files.
-- **More songs**: transcribe something other than Clocks — the engine
-  has enough to compose with now.
+- **More songs**: transcribe something other than Clocks / atgt — the
+  engine has enough to compose with now.
+
+## Vocal extraction pipeline
+
+Established this session for sourcing topline melodies from a finished
+recording. Tools live in the shared venv at
+`/home/david/Work/productivity/claude_skill_building/.venv/` (installed
+ad-hoc, **not declared** in that repo's `requirements.txt`).
+
+1. **Pull audio from YouTube** (artist's official upload preferred):
+   ```bash
+   /home/david/Work/productivity/claude_skill_building/.venv/bin/python3 \
+     -m yt_dlp -x --audio-format mp3 -o "/tmp/audio/%(title)s.%(ext)s" \
+     "<youtube-url>"
+   ```
+2. **Separate into stems with Demucs** (HT-Demucs default, ~2 min CPU):
+   ```bash
+   /home/david/Work/productivity/claude_skill_building/.venv/bin/python3 \
+     -m demucs --two-stems=vocals -o /tmp/demucs "/tmp/audio/<file>.mp3"
+   ```
+   Output: `/tmp/demucs/htdemucs/<title>/vocals.wav` + `no_vocals.wav`.
+3. **Transcribe** the vocal stem — by ear, or with `basic-pitch` (Spotify
+   open-source, not yet installed).
+
+For atgt the stem is at
+`/tmp/demucs/htdemucs/Jeremy Zucker, Chelsea Cutler - and the government too! (Official Lyric Video)/vocals.wav`
+(may need re-running if /tmp is wiped). Quality is excellent on this track —
+near-acapella, easy to hum along with for transcription.
+
+**Caveats**:
+- `python3 -m demucs` (and `-m yt_dlp`), not the bare `demucs` /
+  `yt-dlp` scripts — the wrapper shebangs in this venv are broken.
+- Demucs needs `torchcodec` to actually save WAVs on the current
+  torchaudio version; install it alongside demucs.
+- Don't add demucs/yt-dlp/torchcodec to skill_building's requirements.txt
+  — they're heavy ML deps and not part of any tool there.
 
 **Feedback-loop note**: Gemini audio analysis (`tools/video` with
 `audio/wav`) is useful for sound-design diagnosis (thin tone, no space,
