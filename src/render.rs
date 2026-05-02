@@ -226,6 +226,20 @@ pub fn render_to_wav(
             }
         }
     }
+    // Unison detune.
+    for section in &pattern.sections {
+        for track in &section.tracks {
+            if track.unison.is_none() && track.detune.is_none() {
+                continue;
+            }
+            let Some(va) = alloc.get(&track.name) else { continue };
+            let voices_n = track.unison.unwrap_or(3);
+            let cents = track.detune.unwrap_or(8.0);
+            for idx in va.base..va.base + va.slots {
+                voices[idx].set_unison(voices_n, cents);
+            }
+        }
+    }
 
     // Apply filter config (cutoff / resonance / env depth + filter ADSR)
     // for any track that has at least one filter property set. Falls back

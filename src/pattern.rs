@@ -186,6 +186,13 @@ pub struct Track {
     /// Pitch vibrato depth in semitones (typical 0.05-0.3). `None` / 0 = off.
     /// (`name.vibrato_depth: 0.15`)
     pub vibrato_depth: Option<f32>,
+    /// Unison oscillator count (1, 2, or 3). Adds detuned oscillators to the
+    /// voice for "supersaw"-style thickness — the missing ingredient that
+    /// makes synth strings actually sound like an ensemble. (`name.unison: 3`)
+    pub unison: Option<u8>,
+    /// Total detune spread in cents (1 cent = 1/100 semitone). Typical 5-15.
+    /// (`name.detune: 8`)
+    pub detune: Option<f32>,
 }
 
 /// Which synthesis model a track uses. Default (when unset on a Track) is
@@ -312,7 +319,7 @@ impl fmt::Display for PatternParseError {
             ),
             Self::UnknownProperty { line, track, prop } => write!(
                 f,
-                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave, attack, decay, sustain, release, gain, gate, click, sub, cutoff, resonance, filter_env, filter_attack, filter_decay, filter_sustain, filter_release, model, pluck_decay, pluck_brightness, vibrato_rate, vibrato_depth)"
+                "line {line}: unknown property {prop:?} on track {track:?} (supported: wave, octave, attack, decay, sustain, release, gain, gate, click, sub, cutoff, resonance, filter_env, filter_attack, filter_decay, filter_sustain, filter_release, model, pluck_decay, pluck_brightness, vibrato_rate, vibrato_depth, unison, detune)"
             ),
             Self::InvalidPropertyValue { line, track, prop, value } => write!(
                 f,
@@ -566,6 +573,8 @@ impl Pattern {
                         pluck_brightness: track_props.pluck_brightness,
                         vibrato_rate: track_props.vibrato_rate,
                         vibrato_depth: track_props.vibrato_depth,
+                        unison: track_props.unison,
+                        detune: track_props.detune,
                     });
                 }
             }
@@ -678,6 +687,8 @@ struct TrackProps {
     pluck_brightness: Option<f32>,
     vibrato_rate: Option<f32>,
     vibrato_depth: Option<f32>,
+    unison: Option<u8>,
+    detune: Option<f32>,
 }
 
 fn apply_property(
@@ -896,6 +907,28 @@ fn apply_property(
                 }
             })?;
             out.vibrato_depth = Some(d.max(0.0));
+        }
+        "unison" => {
+            let n: u8 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.unison = Some(n.clamp(1, 3));
+        }
+        "detune" => {
+            let c: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.detune = Some(c.max(0.0));
         }
         _ => {
             return Err(PatternParseError::UnknownProperty {

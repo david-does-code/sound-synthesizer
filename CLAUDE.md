@@ -171,8 +171,14 @@ semitones) — sine LFO modulating oscillator pitch. Phase persists across
 notes so stacked voices with similar rates drift naturally relative to
 each other; that's most of what makes a vocal harmony stack feel human.
 Pluck path is intentionally not modulated (delay-line resampling is its
-own problem). See `patterns/harmony_stack_demo.pat` for a chord-tone
-3-voice stack + vibrato demo.
+own problem). Also added **per-voice unison detune** (`name.unison: 3`,
+`name.detune: 18` cents) — stacks 2-3 oscillators per voice spread by
+±cents/2, summed with √N normalization (decorrelated sum, not coherent).
+This is the "supersaw" trick that turns a single saw into a string section.
+Skipped on the pluck path. The detune-beat lives in the upper harmonics,
+so any voice using unison wants a relatively open filter (cutoff ≥ ~3 kHz)
+or the interesting beating gets filtered out. See
+`patterns/harmony_stack_demo.pat` for the full demo.
 
 **Pick next session by mood:**
 - **Add a lead line to atgt** (in progress — pipeline set up, melody not
@@ -187,13 +193,14 @@ own problem). See `patterns/harmony_stack_demo.pat` for a chord-tone
   were left on the table.
 - **5j + 5k**: TUI grid view + live step editing. Biggest composition
   unlock — turns the iteration loop from "edit-render-listen" into live.
-- **Strings still feel synthy** even with vibrato. Most likely next
-  unlocks: (a) **unison/detune** — stack 2-3 oscillators per voice with
-  cents-level offsets and sum them, gives the "supersaw" thickness real
-  string sections have from many slightly-out-of-tune players; (b)
-  **amp tremolo** (LFO on amplitude — easy mirror of the vibrato code,
-  smaller payoff for strings); (c) **chorus effect** as a master
-  send/insert. Detune is the biggest payoff for the cost.
+- **Strings**: vibrato + unison/detune both done. Remaining moves toward
+  "real strings": (a) **amp tremolo** (LFO on amplitude — easy mirror of
+  the vibrato code), (b) **chorus** as a master send/insert (detune-only
+  gets you ensemble thickness; chorus adds the modulating-delay shimmer
+  that real recorded sections have from mic placement + reverb tails),
+  (c) **per-unison-oscillator vibrato phases** (currently all detuned
+  oscillators share one LFO; staggering them would give a "section vibrato"
+  feel where players don't wobble in sync).
 - **Phase 8 starters**: portamento, 4-pole/ladder filter upgrade,
   key-tracking on the filter cutoff. See PLAN.md.
 - **Velocity humanization**: small per-step timing / velocity jitter in

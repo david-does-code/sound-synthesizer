@@ -330,6 +330,23 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
         }
     }
 
+    /// Push per-track unison config to each voice in `range`. No-op when
+    /// neither `unison` nor `detune` is set.
+    fn apply_unison(
+        engine: &EngineHandle,
+        track: &crate::pattern::Track,
+        range: std::ops::Range<usize>,
+    ) {
+        if track.unison.is_none() && track.detune.is_none() {
+            return;
+        }
+        let voices = track.unison.unwrap_or(3);
+        let cents = track.detune.unwrap_or(8.0);
+        for v in range {
+            engine.set_voice_unison(v, voices, cents);
+        }
+    }
+
     for section in &pattern.sections {
         for track in &section.tracks {
             match &track.kind {
@@ -370,6 +387,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     apply_filter(engine, track, next_voice..next_voice + 1);
                     apply_model(engine, track, next_voice..next_voice + 1);
                     apply_vibrato(engine, track, next_voice..next_voice + 1);
+                    apply_unison(engine, track, next_voice..next_voice + 1);
                     alloc.insert(track.name.clone(), VoiceAlloc { base: next_voice, slots: 1 });
                     next_voice += 1;
                 }
@@ -428,6 +446,7 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     apply_filter(engine, track, next_voice..next_voice + chord_size);
                     apply_model(engine, track, next_voice..next_voice + chord_size);
                     apply_vibrato(engine, track, next_voice..next_voice + chord_size);
+                    apply_unison(engine, track, next_voice..next_voice + chord_size);
                     alloc.insert(
                         track.name.clone(),
                         VoiceAlloc { base: next_voice, slots: chord_size },

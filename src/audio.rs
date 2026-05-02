@@ -309,6 +309,9 @@ pub struct EngineHandle {
     voice_vibrato_rate: Arc<[AtomicU32; MAX_VOICES]>,
     /// Per-voice vibrato depth (semitones, f32 bits). 0.0 = off.
     voice_vibrato_depth: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice unison config: low 32 bits = detune cents (f32 bits),
+    /// high 8 bits = oscillator count (1, 2, or 3). 0 = default (1, 0.0).
+    voice_unison: Arc<[AtomicU64; MAX_VOICES]>,
     sample_clock: Arc<AtomicU64>,
     /// Master reverb wet/dry mix as f32 bits. Read once per frame in the
     /// audio callback and pushed into the Reverb instance.
@@ -473,6 +476,17 @@ impl EngineHandle {
         }
     }
 
+    /// Configure per-voice unison detune. `voices` is total oscillator count
+    /// (1, 2, or 3); `cents` is the spread in cents (typical 5-15). Set
+    /// voices = 1 or cents = 0 to disable.
+    pub fn set_voice_unison(&self, voice_idx: usize, voices: u8, cents: f32) {
+        if voice_idx < MAX_VOICES {
+            let v = voices.clamp(1, 3) as u64;
+            let c_bits = cents.max(0.0).to_bits() as u64;
+            self.voice_unison[voice_idx].store((v << 56) | c_bits, Ordering::Relaxed);
+        }
+    }
+
     /// Configure per-voice pitch vibrato. `rate_hz` is typically 4-7 Hz;
     /// `depth_semitones` is typically 0.05-0.3. Set depth to 0.0 to disable.
     pub fn set_voice_vibrato(&self, voice_idx: usize, rate_hz: f32, depth_semitones: f32) {
@@ -555,6 +569,18 @@ pub struct Voice {
     vibrato_rate: f32,
     vibrato_depth: f32,
     vibrato_phase: f32,
+    /// Unison: total oscillator count per voice (1, 2, or 3). When >1, the
+    /// extra oscillators run at the same waveform / amp envelope but offset in
+    /// pitch by ±detune_cents/2 cents, then summed and normalized. This is the
+    /// "supersaw" trick that gives synth strings their thickness — each
+    /// oscillator beats slightly against the others.
+    /// Default 1 (no extra oscillators, no per-sample cost beyond the main path).
+    unison_voices: u8,
+    /// Total detune spread in cents (1 cent = 1/100 semitone). Typical 5-15.
+    detune_cents: f32,
+    /// Independent phases for the two possible extra oscillators.
+    unison_phase_lo: f32,
+    unison_phase_hi: f32,
 }
 
 impl Voice {
@@ -590,7 +616,22 @@ impl Voice {
             vibrato_rate: 0.0,
             vibrato_depth: 0.0,
             vibrato_phase: 0.0,
+            unison_voices: 1,
+            detune_cents: 0.0,
+            // Stagger initial unison phases so the detuned oscillators don't
+            // start in lockstep with the main one — that would briefly cancel
+            // them at the attack and produce a thin transient.
+            unison_phase_lo: 0.33,
+            unison_phase_hi: 0.66,
         }
+    }
+
+    /// Configure unison detune. `voices` is the total oscillator count per
+    /// voice (clamped to 1-3); `cents` is the total spread in cents. Set
+    /// `voices = 1` (or `cents = 0`) to disable.
+    pub fn set_unison(&mut self, voices: u8, cents: f32) {
+        self.unison_voices = voices.clamp(1, 3);
+        self.detune_cents = cents.max(0.0);
     }
 
     /// Configure pitch vibrato. `rate_hz` is the LFO frequency (typical 4-7 Hz),
@@ -701,6 +742,9 @@ impl Voice {
             return value;
         }
 
+        // Main oscillator. When unison is active, the detuned partials are
+        // summed in below and the whole thing is normalized by voice count
+        // so the perceived loudness stays constant.
         let mut value = waveform.sample(self.phase);
 
         // Sub-octave sine layer (skip the math when off).
@@ -710,6 +754,25 @@ impl Voice {
             self.sub_phase += self.frequency * 0.5 / self.envelope.sample_rate();
             if self.sub_phase >= 1.0 {
                 self.sub_phase -= 1.0;
+            }
+        }
+
+        // Unison detune: 2 or 3 oscillators total, spread by ±detune_cents/2.
+        // The extras share waveform + (effective_freq computed below); they
+        // each have their own phase so they beat against the main oscillator.
+        // Vibrato and click are applied to all of them via effective_freq, so
+        // the whole stack moves together as a single voice.
+        if self.unison_voices > 1 && self.detune_cents > 0.0 {
+            value += waveform.sample(self.unison_phase_lo);
+            if self.unison_voices >= 3 {
+                value += waveform.sample(self.unison_phase_hi);
+                // Detuned oscillators decorrelate over time — they sum more
+                // like √N than N. Dividing by N (the coherent assumption)
+                // just made the patch quieter without revealing the detune;
+                // √N keeps perceived loudness closer to the single-osc case.
+                value *= 0.577; // 1 / sqrt(3)
+            } else {
+                value *= 0.707; // 1 / sqrt(2)
             }
         }
 
@@ -739,9 +802,29 @@ impl Voice {
             self.frequency
         };
 
-        self.phase += effective_freq / self.envelope.sample_rate();
+        let inv_sr = 1.0 / self.envelope.sample_rate();
+        self.phase += effective_freq * inv_sr;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
+        }
+
+        // Advance the unison oscillators' phases. ±detune_cents/2 cents in
+        // frequency = `freq * 2^(±cents/2400)`. Cents are small, so we could
+        // approximate, but exp2 is fine here.
+        if self.unison_voices > 1 && self.detune_cents > 0.0 {
+            let half_cents = self.detune_cents * 0.5;
+            let lo_freq = effective_freq * (-half_cents / 1200.0).exp2();
+            self.unison_phase_lo += lo_freq * inv_sr;
+            if self.unison_phase_lo >= 1.0 {
+                self.unison_phase_lo -= 1.0;
+            }
+            if self.unison_voices >= 3 {
+                let hi_freq = effective_freq * (half_cents / 1200.0).exp2();
+                self.unison_phase_hi += hi_freq * inv_sr;
+                if self.unison_phase_hi >= 1.0 {
+                    self.unison_phase_hi -= 1.0;
+                }
+            }
         }
 
         // Resonant lowpass with envelope-modulated cutoff. The default state
@@ -828,6 +911,8 @@ pub struct AudioEngine {
     /// Per-voice vibrato rate / depth (f32 bits). Both 0.0 = off.
     voice_vibrato_rate: Arc<[AtomicU32; MAX_VOICES]>,
     voice_vibrato_depth: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice unison (packed: high 8 bits = osc count, low 32 = cents f32).
+    voice_unison: Arc<[AtomicU64; MAX_VOICES]>,
     sample_rate: f32,
 }
 
@@ -958,6 +1043,12 @@ impl AudioEngine {
             std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
         );
         let voice_vibrato_depth_clone = voice_vibrato_depth.clone();
+
+        // Unison: 0 means default (1 voice, 0 cents → branch skipped in synth).
+        let voice_unison: Arc<[AtomicU64; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU64::new(0)),
+        );
+        let voice_unison_clone = voice_unison.clone();
         let mut reverb = Reverb::new(0.0);
         // Distinct seeds so each noise drum has its own RNG stream.
         let mut drum_voices: [DrumVoice; NUM_DRUMS] = [
@@ -1040,6 +1131,13 @@ impl AudioEngine {
                             voice_vibrato_depth_clone[i].load(Ordering::Relaxed),
                         );
                         voice.set_vibrato(vrate, vdepth);
+
+                        // Unison: high 8 bits = osc count (0 = default 1),
+                        // low 32 = detune cents as f32 bits.
+                        let u_packed = voice_unison_clone[i].load(Ordering::Relaxed);
+                        let u_voices = ((u_packed >> 56) & 0xFF) as u8;
+                        let u_cents = f32::from_bits((u_packed & 0xFFFF_FFFF) as u32);
+                        voice.set_unison(if u_voices == 0 { 1 } else { u_voices }, u_cents);
                     }
 
                     // Process commands from the main thread
@@ -1202,6 +1300,7 @@ impl AudioEngine {
             voice_pluck,
             voice_vibrato_rate,
             voice_vibrato_depth,
+            voice_unison,
             sample_rate,
         }
     }
@@ -1226,6 +1325,7 @@ impl AudioEngine {
             voice_pluck: self.voice_pluck.clone(),
             voice_vibrato_rate: self.voice_vibrato_rate.clone(),
             voice_vibrato_depth: self.voice_vibrato_depth.clone(),
+            voice_unison: self.voice_unison.clone(),
             sample_clock: self.sample_clock.clone(),
             reverb_mix: self.reverb_mix.clone(),
             sample_rate: self.sample_rate,

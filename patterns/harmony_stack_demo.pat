@@ -60,9 +60,9 @@ strings.sustain: 0.8
 strings.release: 800ms
 strings.gain: 0.35
 strings.gate: 0.95
-strings.cutoff: 1200
-strings.resonance: 0.15
-strings.filter_env: 0.6
+strings.cutoff: 5000
+strings.resonance: 0.1
+strings.filter_env: 0.4
 strings.filter_attack: 400ms
 strings.filter_release: 600ms
 # Slow, shallow vibrato on the strings — that's the missing "movement" that
@@ -70,6 +70,12 @@ strings.filter_release: 600ms
 # than singers (~3-4 Hz vs ~5 Hz on vocals).
 strings.vibrato_rate: 3.5
 strings.vibrato_depth: 0.08
+
+# Unison detune: 3 oscillators per voice, ±5 cents around center. This is the
+# "many slightly out-of-tune players" trick that gives real string sections
+# their thickness — single oscillator = one violin, three detuned = a section.
+strings.unison: 3
+strings.detune: 18
 
 # --- Bass ---
 bass.wave: sine
