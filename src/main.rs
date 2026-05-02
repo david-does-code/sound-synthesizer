@@ -3,6 +3,7 @@ mod envelope;
 mod keyboard;
 mod notes;
 mod pattern;
+mod render;
 mod sequencer;
 mod visualizer;
 
@@ -72,6 +73,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--play" {
         play_pattern(&args[2]);
+        return;
+    }
+    if args.len() >= 4 && args[1] == "--render" {
+        render_pattern(&args[2], &args[3]);
         return;
     }
     if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
@@ -414,7 +419,34 @@ fn print_cli_help() {
     println!("Usage:");
     println!("  cargo run                       Interactive keyboard piano");
     println!("  cargo run -- --play <file.pat>  Play a pattern file in a loop");
+    println!("  cargo run -- --render <file.pat> <out.wav>  Render one pass to WAV");
     println!("  cargo run -- --help             Show this help");
+}
+
+fn render_pattern(input: &str, output: &str) {
+    let pattern = match Pattern::from_file(input) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to load pattern '{input}': {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("  Rendering {input}  →  {output}");
+    match render::render_to_wav(&pattern, std::path::Path::new(output)) {
+        Ok(stats) => {
+            println!(
+                "  Done. {:.2}s, {} sections, peak {:.3}",
+                stats.duration_secs, stats.sections_played, stats.peak_amplitude
+            );
+            if stats.peak_amplitude >= 1.0 {
+                println!("  ⚠  output clipped (peak ≥ 1.0)");
+            }
+        }
+        Err(e) => {
+            eprintln!("Render failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn play_pattern(path: &str) {

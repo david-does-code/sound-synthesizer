@@ -17,7 +17,7 @@ pub enum Drum {
     HiHat = 2,
 }
 
-const NUM_DRUMS: usize = 3;
+pub const NUM_DRUMS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -145,7 +145,10 @@ fn unpack_voice_event(packed: u64) -> (u8, u64, u8, f32) {
 ///
 /// Phase is accumulated incrementally rather than recomputed from `t` so the
 /// pitch sweep stays continuous with no discontinuities.
-struct DrumVoice {
+///
+/// Public so the offline WAV renderer can reuse the same synthesis math as
+/// the live engine.
+pub struct DrumVoice {
     kind: Drum,
     sample_rate: f32,
     /// Sample index since trigger; `u32::MAX` means inactive.
@@ -159,7 +162,7 @@ struct DrumVoice {
 }
 
 impl DrumVoice {
-    fn new(kind: Drum, sample_rate: f32, seed: u32) -> Self {
+    pub fn new(kind: Drum, sample_rate: f32, seed: u32) -> Self {
         DrumVoice {
             kind,
             sample_rate,
@@ -170,14 +173,14 @@ impl DrumVoice {
         }
     }
 
-    fn trigger_with_velocity(&mut self, vel: f32) {
+    pub fn trigger_with_velocity(&mut self, vel: f32) {
         self.sample_idx = 0;
         self.phase = 0.0;
         self.velocity = vel;
     }
 
     #[allow(dead_code)]
-    fn trigger(&mut self) {
+    pub fn trigger(&mut self) {
         self.trigger_with_velocity(1.0);
     }
 
@@ -191,7 +194,7 @@ impl DrumVoice {
         (x as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 
-    fn next_sample(&mut self) -> f32 {
+    pub fn next_sample(&mut self) -> f32 {
         if self.sample_idx == u32::MAX {
             return 0.0;
         }
@@ -368,10 +371,14 @@ impl EngineHandle {
 }
 
 /// State for a single voice inside the audio callback.
-struct Voice {
+///
+/// Public so the offline WAV renderer can reuse the same synthesis math as
+/// the live engine. The live engine drives this via lock-free atomics; the
+/// offline renderer drives it directly with method calls.
+pub struct Voice {
     frequency: f32,
     phase: f32,
-    envelope: Envelope,
+    pub envelope: Envelope,
     active: bool,
     /// Per-note velocity (0.0–1.0), set on note-on.
     velocity: f32,
@@ -379,11 +386,11 @@ struct Voice {
     last_adsr: u64,
     /// Gate auto-release countdown. When > 0, decrements each sample.
     /// When it reaches 0, gate_off is triggered. Set from voice_gate on note-on.
-    gate_remaining: u64,
+    pub gate_remaining: u64,
 }
 
 impl Voice {
-    fn new(sample_rate: f32) -> Self {
+    pub fn new(sample_rate: f32) -> Self {
         Voice {
             frequency: 0.0,
             phase: 0.0,
@@ -395,7 +402,26 @@ impl Voice {
         }
     }
 
-    fn next_sample(&mut self, waveform: Waveform) -> f32 {
+    /// Trigger a note-on directly (for offline rendering).
+    pub fn trigger(&mut self, midi: u8, velocity: f32) {
+        self.frequency = midi_to_freq(midi);
+        self.phase = 0.0;
+        self.velocity = velocity;
+        self.active = true;
+        self.envelope.gate_on();
+    }
+
+    /// Release the note (gate-off), entering the release phase.
+    pub fn release(&mut self) {
+        self.envelope.gate_off();
+        self.gate_remaining = 0;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn next_sample(&mut self, waveform: Waveform) -> f32 {
         if !self.active {
             return 0.0;
         }
