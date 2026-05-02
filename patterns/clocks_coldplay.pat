@@ -26,6 +26,8 @@ piano.gain: 1.2
 # bend ~1-2 semitones; bigger numbers sound like a chirp / zap rather than
 # a thwack.
 piano.click: 3
+# Sub-octave sine layer for warmth/body. ~0.3 thickens without muddying.
+piano.sub: 0.3
 
 # Pad: sustained chords underneath for warmth, quiet in the mix
 pad.wave: triangle

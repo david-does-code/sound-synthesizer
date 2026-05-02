@@ -160,6 +160,9 @@ pub struct DrumVoice {
     rng: u32,
     /// Velocity of the current hit (0.0–1.0).
     velocity: f32,
+    /// One-pole lowpass state for filtered noise (used by HiHat to tame the
+    /// screechy top end of pure white noise).
+    lp_state: f32,
 }
 
 impl DrumVoice {
@@ -171,6 +174,7 @@ impl DrumVoice {
             phase: 0.0,
             rng: seed,
             velocity: 1.0,
+            lp_state: 0.0,
         }
     }
 
@@ -232,8 +236,16 @@ impl DrumVoice {
                 (amp, signal)
             }
             Drum::HiHat => {
-                let amp = (-t * 70.0).exp() * 0.6;
-                (amp, self.noise())
+                // White noise is flat to 22 kHz; real closed hi-hats peak
+                // around 8-10 kHz and roll off sharply above that. A one-pole
+                // lowpass at ~9 kHz tames the screechy ultra-highs and leaves
+                // the metallic "tss" band intact. Coefficient α tuned by ear:
+                // α=0.55 gives roughly a 9 kHz corner at 44.1 kHz sample rate.
+                let raw = self.noise();
+                self.lp_state = 0.55 * raw + 0.45 * self.lp_state;
+                // Slightly slower decay (50 vs 70) so it has a bit more body.
+                let amp = (-t * 50.0).exp() * 0.6;
+                (amp, self.lp_state)
             }
         };
 
@@ -272,6 +284,11 @@ pub struct EngineHandle {
     /// Per-voice gate duration in samples. 0 = legato (no auto-release).
     /// Read by the callback on each note-on to set a countdown timer.
     voice_gate: Arc<[AtomicU64; MAX_VOICES]>,
+    /// Per-voice hammer-click amount in semitones (f32 bits as u32).
+    /// 0.0 = no transient. Read once on each note-on.
+    voice_click: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice sub-octave sine layer amplitude (f32 bits). 0.0 = off.
+    voice_sub: Arc<[AtomicU32; MAX_VOICES]>,
     drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
     sample_clock: Arc<AtomicU64>,
     /// Master reverb wet/dry mix as f32 bits. Read once per frame in the
@@ -373,6 +390,21 @@ impl EngineHandle {
         }
     }
 
+    /// Set per-voice hammer-click amount (semitones of pitch transient on
+    /// each note-on). 0.0 = no transient.
+    pub fn set_voice_click(&self, voice_idx: usize, semitones: f32) {
+        if voice_idx < MAX_VOICES {
+            self.voice_click[voice_idx].store(semitones.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Set per-voice sub-octave sine layer amplitude (0.0 = off).
+    pub fn set_voice_sub(&self, voice_idx: usize, amount: f32) {
+        if voice_idx < MAX_VOICES {
+            self.voice_sub[voice_idx].store(amount.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
     /// Set master reverb wet/dry mix (0.0 = dry, ~0.2–0.3 = roomy).
     pub fn set_reverb_mix(&self, mix: f32) {
         self.reverb_mix.store(mix.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -405,6 +437,12 @@ pub struct Voice {
     /// Per-sample multiplier for `click_current`. Computed once from the
     /// configured decay time when `set_click` is called.
     click_decay: f32,
+    /// Sub-octave sine layer amplitude (0.0 = off). When >0, the voice mixes
+    /// in a sine wave one octave below the main note's frequency at this
+    /// amplitude — adds body / warmth.
+    sub_amount: f32,
+    /// Independent phase accumulator for the sub-octave sine. Reset on trigger.
+    sub_phase: f32,
 }
 
 impl Voice {
@@ -424,6 +462,8 @@ impl Voice {
             click_initial: 0.0,
             click_current: 0.0,
             click_decay: decay,
+            sub_amount: 0.0,
+            sub_phase: 0.0,
         }
     }
 
@@ -434,10 +474,17 @@ impl Voice {
         self.click_initial = semitones;
     }
 
+    /// Configure the sub-octave sine layer. `amount` is the relative
+    /// amplitude (0.0 = off, 1.0 = same level as the main waveform).
+    pub fn set_sub(&mut self, amount: f32) {
+        self.sub_amount = amount.clamp(0.0, 1.0);
+    }
+
     /// Trigger a note-on directly (for offline rendering).
     pub fn trigger(&mut self, midi: u8, velocity: f32) {
         self.frequency = midi_to_freq(midi);
         self.phase = 0.0;
+        self.sub_phase = 0.0;
         self.velocity = velocity;
         self.active = true;
         self.envelope.gate_on();
@@ -466,7 +513,19 @@ impl Voice {
             return 0.0;
         }
 
-        let value = waveform.sample(self.phase) * env_amp * self.velocity;
+        let mut value = waveform.sample(self.phase);
+
+        // Sub-octave sine layer (skip the math when off).
+        if self.sub_amount > 0.0 {
+            value += (self.sub_phase * TAU).sin() * self.sub_amount;
+            // Sub frequency is one octave (=half) below the main pitch.
+            self.sub_phase += self.frequency * 0.5 / self.envelope.sample_rate();
+            if self.sub_phase >= 1.0 {
+                self.sub_phase -= 1.0;
+            }
+        }
+
+        value *= env_amp * self.velocity;
 
         // Apply hammer-click pitch transient if active. Skip the math when
         // the offset is essentially zero (the common case).
@@ -522,6 +581,10 @@ pub struct AudioEngine {
     /// Per-voice gate duration in samples (0 = legato). The callback reads
     /// this on note-on and sets a countdown to auto-release the voice.
     voice_gate: Arc<[AtomicU64; MAX_VOICES]>,
+    /// Per-voice hammer-click pitch transient in semitones (f32 bits).
+    voice_click: Arc<[AtomicU32; MAX_VOICES]>,
+    /// Per-voice sub-octave sine amplitude (f32 bits).
+    voice_sub: Arc<[AtomicU32; MAX_VOICES]>,
     /// Per-drum gain multiplier (f32 bits stored as u32). Default 1.0.
     drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
     /// Per-drum scheduled trigger time (absolute audio sample), 0 = none.
@@ -589,6 +652,18 @@ impl AudioEngine {
             std::array::from_fn(|_| AtomicU64::new(0)),
         );
         let voice_gate_clone = voice_gate.clone();
+
+        // Per-voice hammer click (semitones, f32 bits, default 0.0).
+        let voice_click: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+        );
+        let voice_click_clone = voice_click.clone();
+
+        // Per-voice sub-octave amplitude (f32 bits, default 0.0).
+        let voice_sub: Arc<[AtomicU32; MAX_VOICES]> = Arc::new(
+            std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+        );
+        let voice_sub_clone = voice_sub.clone();
 
         // Per-drum gain (f32 bits as u32). Default 1.0.
         let drum_gains: Arc<[AtomicU32; NUM_DRUMS]> = Arc::new(
@@ -723,12 +798,17 @@ impl AudioEngine {
                             }
                             match kind {
                                 EVENT_PLAY => {
-                                    voices[i].frequency = midi_to_freq(midi);
-                                    voices[i].phase = 0.0;
-                                    voices[i].velocity = vel;
-                                    voices[i].active = true;
-                                    voices[i].envelope.gate_on();
-                                    // Read gate duration: 0 = legato (no auto-release).
+                                    // Pull current click + sub amounts, then
+                                    // trigger (which resets per-note state).
+                                    let click = f32::from_bits(
+                                        voice_click_clone[i].load(Ordering::Relaxed),
+                                    );
+                                    let sub = f32::from_bits(
+                                        voice_sub_clone[i].load(Ordering::Relaxed),
+                                    );
+                                    voices[i].set_click(click);
+                                    voices[i].set_sub(sub);
+                                    voices[i].trigger(midi, vel);
                                     voices[i].gate_remaining =
                                         voice_gate_clone[i].load(Ordering::Relaxed);
                                     active_clone[i].store(true, Ordering::Relaxed);
@@ -801,6 +881,8 @@ impl AudioEngine {
             voice_adsr,
             voice_gains,
             voice_gate,
+            voice_click,
+            voice_sub,
             drum_gains,
             drum_schedule,
             voice_events,
@@ -820,6 +902,8 @@ impl AudioEngine {
             voice_adsr: self.voice_adsr.clone(),
             voice_gains: self.voice_gains.clone(),
             voice_gate: self.voice_gate.clone(),
+            voice_click: self.voice_click.clone(),
+            voice_sub: self.voice_sub.clone(),
             drum_gains: self.drum_gains.clone(),
             sample_clock: self.sample_clock.clone(),
             reverb_mix: self.reverb_mix.clone(),

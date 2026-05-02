@@ -145,6 +145,10 @@ pub struct Track {
     /// target pitch over a few milliseconds, simulating a piano hammer's
     /// percussive attack. 0 / None = no transient. (`name.click: 12`)
     pub click: Option<f32>,
+    /// Per-track sub-octave layer amplitude. When set, the voice mixes in a
+    /// sine wave one octave below each note at this amplitude (0.0–1.0).
+    /// Adds body / warmth to thin synth leads. (`name.sub: 0.3`)
+    pub sub: Option<f32>,
 }
 
 /// What this track plays.
@@ -484,6 +488,7 @@ impl Pattern {
                         gain: track_props.gain,
                         gate: track_props.gate,
                         click: track_props.click,
+                        sub: track_props.sub,
                     });
                 }
             }
@@ -582,6 +587,7 @@ struct TrackProps {
     gain: Option<f32>,
     gate: Option<f32>,
     click: Option<f32>,
+    sub: Option<f32>,
 }
 
 fn apply_property(
@@ -672,6 +678,17 @@ fn apply_property(
                 }
             })?;
             out.click = Some(c);
+        }
+        "sub" => {
+            let s: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.sub = Some(s.clamp(0.0, 1.0));
         }
         _ => {
             return Err(PatternParseError::UnknownProperty {

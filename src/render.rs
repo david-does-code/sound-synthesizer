@@ -204,8 +204,11 @@ pub fn render_to_wav(
     for (i, params) in voice_adsr.iter().enumerate() {
         voices[i].envelope.set_params(*params);
     }
-    for (idx, semitones) in collect_clicks(pattern, &alloc) {
+    for (idx, semitones) in collect_voice_property(pattern, &alloc, |t| t.click) {
         voices[idx].set_click(semitones);
+    }
+    for (idx, amount) in collect_voice_property(pattern, &alloc, |t| t.sub) {
+        voices[idx].set_sub(amount);
     }
     let mut drums: [DrumVoice; NUM_DRUMS] = [
         DrumVoice::new(Drum::Kick, SAMPLE_RATE, 0x1234_5678),
@@ -455,21 +458,24 @@ fn apply_track_settings(
     }
 }
 
-/// Per-track click amounts collected during pre-resolve, applied to voices
-/// before rendering. (`apply_track_settings` only handles the simple parallel
-/// arrays — click is applied directly on Voice via `set_click`.)
-fn collect_clicks(
+/// Collect (voice_idx, value) pairs for one of the per-voice properties
+/// (click or sub) that are applied directly on Voice via setter methods.
+fn collect_voice_property<F>(
     pattern: &Pattern,
     alloc: &HashMap<String, VoiceAlloc>,
-) -> Vec<(usize, f32)> {
+    pick: F,
+) -> Vec<(usize, f32)>
+where
+    F: Fn(&Track) -> Option<f32>,
+{
     let mut out: Vec<(usize, f32)> = Vec::new();
     for section in &pattern.sections {
         for track in &section.tracks {
-            let Some(c) = track.click else { continue };
+            let Some(v) = pick(track) else { continue };
             let Some(va) = alloc.get(&track.name) else { continue };
             for s in 0..va.slots {
-                if !out.iter().any(|(v, _)| *v == va.base + s) {
-                    out.push((va.base + s, c));
+                if !out.iter().any(|(idx, _)| *idx == va.base + s) {
+                    out.push((va.base + s, v));
                 }
             }
         }

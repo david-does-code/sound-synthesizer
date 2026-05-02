@@ -286,6 +286,12 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     if let Some(gain) = track.gain {
                         engine.set_voice_gain(next_voice, gain);
                     }
+                    if let Some(click) = track.click {
+                        engine.set_voice_click(next_voice, click);
+                    }
+                    if let Some(sub) = track.sub {
+                        engine.set_voice_sub(next_voice, sub);
+                    }
                     alloc.insert(track.name.clone(), VoiceAlloc { base: next_voice, slots: 1 });
                     next_voice += 1;
                 }
@@ -329,6 +335,16 @@ fn pre_resolve(pattern: &Pattern, engine: &EngineHandle) -> Vec<ResolvedSection>
                     if let Some(gain) = track.gain {
                         for v in next_voice..(next_voice + chord_size) {
                             engine.set_voice_gain(v, gain);
+                        }
+                    }
+                    if let Some(click) = track.click {
+                        for v in next_voice..(next_voice + chord_size) {
+                            engine.set_voice_click(v, click);
+                        }
+                    }
+                    if let Some(sub) = track.sub {
+                        for v in next_voice..(next_voice + chord_size) {
+                            engine.set_voice_sub(v, sub);
                         }
                     }
                     alloc.insert(
