@@ -4,6 +4,7 @@ mod keyboard;
 mod notes;
 mod pattern;
 mod render;
+mod reverb;
 mod sequencer;
 mod visualizer;
 
@@ -82,6 +83,15 @@ fn main() {
     if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
         print_cli_help();
         return;
+    }
+    // Any other arg is a usage error — without this guard, unknown args silently
+    // fell through to the interactive piano, which surprised users who expected
+    // e.g. `cargo run foo.wav` to play the WAV.
+    if args.len() >= 2 {
+        eprintln!("Unknown argument: {}", args[1]);
+        eprintln!();
+        print_cli_help();
+        std::process::exit(2);
     }
 
     let engine = AudioEngine::new();

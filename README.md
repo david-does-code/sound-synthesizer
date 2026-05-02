@@ -64,8 +64,18 @@ Notes are shaped by an Attack-Decay-Sustain-Release envelope instead of playing 
 
 ```bash
 cargo build
-cargo run
+cargo run                                     # interactive piano (default)
+cargo run -- --play patterns/cm_groove.pat    # play a pattern in a loop
+cargo run -- --render patterns/foo.pat out.wav  # render one pass to a WAV
 ```
+
+To listen to a rendered WAV, use any system audio player. `mpv` works well:
+
+```bash
+mpv /tmp/clocks.wav
+```
+
+`aplay` (ALSA, usually preinstalled on Linux) and `paplay` (PulseAudio) also work.
 
 ## Project Structure
 

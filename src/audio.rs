@@ -1,4 +1,5 @@
 use crate::envelope::{AdsrParams, Envelope};
+use crate::reverb::Reverb;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -273,6 +274,9 @@ pub struct EngineHandle {
     voice_gate: Arc<[AtomicU64; MAX_VOICES]>,
     drum_gains: Arc<[AtomicU32; NUM_DRUMS]>,
     sample_clock: Arc<AtomicU64>,
+    /// Master reverb wet/dry mix as f32 bits. Read once per frame in the
+    /// audio callback and pushed into the Reverb instance.
+    reverb_mix: Arc<AtomicU32>,
     sample_rate: f32,
 }
 
@@ -368,6 +372,11 @@ impl EngineHandle {
             self.voice_gate[voice_idx].store(samples, Ordering::Relaxed);
         }
     }
+
+    /// Set master reverb wet/dry mix (0.0 = dry, ~0.2–0.3 = roomy).
+    pub fn set_reverb_mix(&self, mix: f32) {
+        self.reverb_mix.store(mix.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// State for a single voice inside the audio callback.
@@ -387,10 +396,23 @@ pub struct Voice {
     /// Gate auto-release countdown. When > 0, decrements each sample.
     /// When it reaches 0, gate_off is triggered. Set from voice_gate on note-on.
     pub gate_remaining: u64,
+    /// "Hammer click" config: how many semitones above target pitch each note
+    /// starts when triggered. 0.0 = no transient. Multiplied per sample by
+    /// `click_decay` so the offset fades to ~0 in a few ms.
+    click_initial: f32,
+    /// Current click offset in semitones. Decays each sample toward 0.
+    click_current: f32,
+    /// Per-sample multiplier for `click_current`. Computed once from the
+    /// configured decay time when `set_click` is called.
+    click_decay: f32,
 }
 
 impl Voice {
     pub fn new(sample_rate: f32) -> Self {
+        // Default click decay: 8ms time constant. Multiplier per sample is
+        // exp(-1 / (decay_secs * sample_rate)). Recomputed by set_click if
+        // the user sets a non-zero click amount.
+        let decay = (-1.0_f32 / (0.008 * sample_rate)).exp();
         Voice {
             frequency: 0.0,
             phase: 0.0,
@@ -399,7 +421,17 @@ impl Voice {
             velocity: 1.0,
             last_adsr: 0,
             gate_remaining: 0,
+            click_initial: 0.0,
+            click_current: 0.0,
+            click_decay: decay,
         }
+    }
+
+    /// Configure the per-note pitch transient ("hammer click"). On every
+    /// note-on, the voice's pitch starts `semitones` above the target and
+    /// exponentially decays back to the target over ~8ms.
+    pub fn set_click(&mut self, semitones: f32) {
+        self.click_initial = semitones;
     }
 
     /// Trigger a note-on directly (for offline rendering).
@@ -409,6 +441,7 @@ impl Voice {
         self.velocity = velocity;
         self.active = true;
         self.envelope.gate_on();
+        self.click_current = self.click_initial;
     }
 
     /// Release the note (gate-off), entering the release phase.
@@ -435,7 +468,18 @@ impl Voice {
 
         let value = waveform.sample(self.phase) * env_amp * self.velocity;
 
-        self.phase += self.frequency / self.envelope.sample_rate();
+        // Apply hammer-click pitch transient if active. Skip the math when
+        // the offset is essentially zero (the common case).
+        let effective_freq = if self.click_current.abs() > 0.001 {
+            // 2^(semitones/12), but exp2 is faster than powf.
+            let mult = (self.click_current / 12.0).exp2();
+            self.click_current *= self.click_decay;
+            self.frequency * mult
+        } else {
+            self.frequency
+        };
+
+        self.phase += effective_freq / self.envelope.sample_rate();
         if self.phase >= 1.0 {
             self.phase -= 1.0;
         }
@@ -488,6 +532,9 @@ pub struct AudioEngine {
     /// Audio callback's current sample position. Used by the sequencer for
     /// sample-accurate scheduling.
     sample_clock: Arc<AtomicU64>,
+    /// Master reverb wet/dry mix as f32 bits. Lives outside the callback so
+    /// the sequencer / main thread can change it lock-free.
+    reverb_mix: Arc<AtomicU32>,
     sample_rate: f32,
 }
 
@@ -566,6 +613,10 @@ impl AudioEngine {
 
         let sample_clock = Arc::new(AtomicU64::new(0));
         let sample_clock_clone = sample_clock.clone();
+
+        let reverb_mix = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let reverb_mix_clone = reverb_mix.clone();
+        let mut reverb = Reverb::new(0.0);
         // Distinct seeds so each noise drum has its own RNG stream.
         let mut drum_voices: [DrumVoice; NUM_DRUMS] = [
             DrumVoice::new(Drum::Kick, sample_rate, 0x1234_5678),
@@ -634,6 +685,12 @@ impl AudioEngine {
                     // Cache the sample clock locally so we don't pay an atomic
                     // load on every frame.
                     let mut local_clock = sample_clock_clone.load(Ordering::Relaxed);
+
+                    // Pick up any reverb mix change from outside.
+                    let new_mix = f32::from_bits(reverb_mix_clone.load(Ordering::Relaxed));
+                    if (new_mix - reverb.mix()).abs() > f32::EPSILON {
+                        reverb.set_mix(new_mix);
+                    }
 
                     // Generate audio: mix all active voices
                     for frame in data.chunks_mut(channels) {
@@ -714,6 +771,9 @@ impl AudioEngine {
                         }
                         value += drum_mix * 0.5;
 
+                        // Master reverb (no-op when mix is 0.0).
+                        value = reverb.process(value);
+
                         for sample in frame.iter_mut() {
                             *sample = value;
                         }
@@ -745,6 +805,7 @@ impl AudioEngine {
             drum_schedule,
             voice_events,
             sample_clock,
+            reverb_mix,
             sample_rate,
         }
     }
@@ -761,6 +822,7 @@ impl AudioEngine {
             voice_gate: self.voice_gate.clone(),
             drum_gains: self.drum_gains.clone(),
             sample_clock: self.sample_clock.clone(),
+            reverb_mix: self.reverb_mix.clone(),
             sample_rate: self.sample_rate,
         }
     }

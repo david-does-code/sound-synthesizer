@@ -9,6 +9,8 @@
 
 bpm: 130
 steps: 16
+# Master reverb send. ~0.25 = a clear small-room space; 0.0 = dry.
+reverb: 0.25
 
 # Piano riff: triangle is the softest waveform we have — less buzzy
 # than square. The ADSR mimics a piano hammer: sharp attack, fast
@@ -20,6 +22,10 @@ piano.decay: 0.25
 piano.sustain: 0.15
 piano.release: 200ms
 piano.gain: 1.2
+# Hammer click: each note starts +12 semitones and decays to target in ~8ms.
+# Simulates a piano hammer's percussive attack — adds the "thwack" the pure
+# triangle wave is missing.
+piano.click: 12
 
 # Pad: sustained chords underneath for warmth, quiet in the mix
 pad.wave: triangle

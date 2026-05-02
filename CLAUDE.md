@@ -57,9 +57,12 @@ See PLAN.md for the roadmap and current progress.
   note-on/drum events, and schedules automatic note-offs when gate < 1.0. At section
   transitions, voices owned by tracks that don't appear in the new section get released.
   Releases all owned voices on stop. Lookahead is ~100 ms.
-- `src/main.rs` — Two interactive modes (piano + ADSR editor, Tab toggles) plus a CLI
-  pattern player: `cargo run -- --play <file.pat>` loads a pattern and plays it in a
-  loop until Enter is pressed. `--help` lists usage.
+- `src/main.rs` — Two interactive modes (piano + ADSR editor, Tab toggles) plus CLI
+  modes: `cargo run -- --play <file.pat>` loads a pattern and plays it in a loop
+  until Enter is pressed; `cargo run -- --render <file.pat> <out.wav>` renders one
+  pass of the song to a 16-bit mono 44.1 kHz WAV (uses the offline renderer in
+  `src/render.rs`). `--help` lists usage. To listen to a rendered WAV, use a
+  system player: `mpv out.wav` (preferred), or `aplay`/`paplay`.
 - `src/visualizer.rs` — Renders waveforms and ADSR envelopes using Unicode braille characters
   (2×4 dot grid per character). Shared `render_braille` function for both.
 - `src/notes.rs` — Keyboard layout diagram.

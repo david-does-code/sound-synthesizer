@@ -11,6 +11,7 @@
 use crate::audio::{Drum, DrumVoice, Voice, Waveform, MAX_VOICES, NUM_DRUMS};
 use crate::envelope::AdsrParams;
 use crate::pattern::{Cell, ChordCell, Pattern, Track, TrackKind};
+use crate::reverb::Reverb;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -203,6 +204,9 @@ pub fn render_to_wav(
     for (i, params) in voice_adsr.iter().enumerate() {
         voices[i].envelope.set_params(*params);
     }
+    for (idx, semitones) in collect_clicks(pattern, &alloc) {
+        voices[idx].set_click(semitones);
+    }
     let mut drums: [DrumVoice; NUM_DRUMS] = [
         DrumVoice::new(Drum::Kick, SAMPLE_RATE, 0x1234_5678),
         DrumVoice::new(Drum::Snare, SAMPLE_RATE, 0x9E37_79B9),
@@ -295,6 +299,18 @@ pub fn render_to_wav(
         &mut drums,
         &drum_gain,
     );
+
+    // ─── Master reverb ───────────────────────────────────────────────
+    // Single send-style reverb on the full master mix. A second pass over
+    // the dry buffer feeds each sample through the reverb in order, so
+    // echoes of earlier samples land naturally on later ones (including
+    // during the release tail).
+    if pattern.reverb > 0.0 {
+        let mut reverb = Reverb::new(pattern.reverb);
+        for s in samples.iter_mut() {
+            *s = reverb.process(*s);
+        }
+    }
 
     // ─── Write WAV ───────────────────────────────────────────────────
     let spec = hound::WavSpec {
@@ -437,6 +453,28 @@ fn apply_track_settings(
             voice_gain[v] = g;
         }
     }
+}
+
+/// Per-track click amounts collected during pre-resolve, applied to voices
+/// before rendering. (`apply_track_settings` only handles the simple parallel
+/// arrays — click is applied directly on Voice via `set_click`.)
+fn collect_clicks(
+    pattern: &Pattern,
+    alloc: &HashMap<String, VoiceAlloc>,
+) -> Vec<(usize, f32)> {
+    let mut out: Vec<(usize, f32)> = Vec::new();
+    for section in &pattern.sections {
+        for track in &section.tracks {
+            let Some(c) = track.click else { continue };
+            let Some(va) = alloc.get(&track.name) else { continue };
+            for s in 0..va.slots {
+                if !out.iter().any(|(v, _)| *v == va.base + s) {
+                    out.push((va.base + s, c));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn max_chord_size(cells: &[ChordCell]) -> usize {

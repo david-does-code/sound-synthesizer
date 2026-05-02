@@ -91,6 +91,9 @@ pub struct Pattern {
     pub bpm: u32,
     /// Global swing amount (0.0–1.0). 0.0 = straight, 0.5 = full triplet feel.
     pub swing: f32,
+    /// Reverb wet/dry mix (0.0–1.0). 0.0 = dry (default), ~0.2–0.3 = roomy.
+    /// Applied to the master mix as a single send-style reverb.
+    pub reverb: f32,
     pub sections: Vec<Section>,
     pub song: Vec<SongEntry>,
 }
@@ -137,6 +140,11 @@ pub struct Track {
     pub gain: Option<f32>,
     /// Per-track gate length as fraction of step (`name.gate: 0.5`). `None` = legato.
     pub gate: Option<f32>,
+    /// Per-track "hammer click" — pitch transient on note-on, in semitones.
+    /// Each note starts pitched up by this many semitones and decays to its
+    /// target pitch over a few milliseconds, simulating a piano hammer's
+    /// percussive attack. 0 / None = no transient. (`name.click: 12`)
+    pub click: Option<f32>,
 }
 
 /// What this track plays.
@@ -323,6 +331,7 @@ impl Pattern {
         let mut bpm: Option<u32> = None;
         let mut global_steps: Option<usize> = None;
         let mut global_swing: f32 = 0.0;
+        let mut global_reverb: f32 = 0.0;
         let mut sections: Vec<Section> = Vec::new();
         let mut song: Vec<SongEntry> = Vec::new();
 
@@ -424,6 +433,16 @@ impl Pattern {
                 "song" => {
                     song = parse_song_chain(line_no, value)?;
                 }
+                "reverb" => {
+                    let r: f32 = value.parse().map_err(|_| {
+                        PatternParseError::InvalidHeaderValue {
+                            line: line_no,
+                            key: key.to_string(),
+                            value: value.to_string(),
+                        }
+                    })?;
+                    global_reverb = r.clamp(0.0, 1.0);
+                }
                 _ => {
                     // It's a track row. Make sure we have a section to put it in.
                     if current.is_none() && implicit_section {
@@ -464,6 +483,7 @@ impl Pattern {
                         release: track_props.release,
                         gain: track_props.gain,
                         gate: track_props.gate,
+                        click: track_props.click,
                     });
                 }
             }
@@ -499,6 +519,7 @@ impl Pattern {
         Ok(Pattern {
             bpm: bpm.ok_or(PatternParseError::MissingHeader("bpm"))?,
             swing: global_swing,
+            reverb: global_reverb,
             sections,
             song,
         })
@@ -560,6 +581,7 @@ struct TrackProps {
     release: Option<f32>,
     gain: Option<f32>,
     gate: Option<f32>,
+    click: Option<f32>,
 }
 
 fn apply_property(
@@ -639,6 +661,17 @@ fn apply_property(
                 }
             })?;
             out.gate = Some(g.clamp(0.0, 1.0));
+        }
+        "click" => {
+            let c: f32 = value.parse().map_err(|_| {
+                PatternParseError::InvalidPropertyValue {
+                    line: line_no,
+                    track: track.to_string(),
+                    prop: prop.to_string(),
+                    value: value.to_string(),
+                }
+            })?;
+            out.click = Some(c);
         }
         _ => {
             return Err(PatternParseError::UnknownProperty {

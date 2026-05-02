@@ -111,6 +111,8 @@ impl Sequencer {
 
         // Pre-resolve voice allocations and per-section dispatch tables.
         let resolved_sections = pre_resolve(&pattern, &engine);
+        // Master reverb is a global pattern property; apply it once at startup.
+        engine.set_reverb_mix(pattern.reverb);
         let song = pattern.song.clone();
 
         let handle = thread::spawn(move || {
